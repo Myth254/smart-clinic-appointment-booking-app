@@ -7,7 +7,7 @@ import generateToken from '../utils/generateToken.js'
 
 const registerUser = async (req, res) => {
   try {
-    const { firstName, lastName, email, password, role } = req.body
+    const { firstName, lastName, email, phoneNumber, password, role } = req.body
 
     // Check if user exists
     const userExists = await User.findOne({ email })
@@ -19,8 +19,9 @@ const registerUser = async (req, res) => {
       firstName,
       lastName,
       email,
+      phoneNumber,
       password,
-      role,
+      role: role || 'patient',
     })
 
     if (user) {
@@ -31,7 +32,8 @@ const registerUser = async (req, res) => {
           firstName: user.firstName,
           lastName: user.lastName,
           email: user.email,
-          role: user.role,
+          phoneNumber: user.phoneNumber,
+          role: user.role
         },
         token: generateToken(user._id, user.role),
       })
@@ -60,7 +62,8 @@ const loginUser = async (req, res) => {
           firstName: user.firstName,
           lastName: user.lastName,
           email: user.email,
-          role: user.role,
+          phoneNumber: user.phoneNumber,
+          role: user.role
         },
       })
     } else {
@@ -81,7 +84,8 @@ const getMe = async (req, res) => {
       firstName: req.user.firstName,
       lastName: req.user.lastName,
       email: req.user.email,
-      role: req.user.role,
+      phoneNumber: req.user.phoneNumber,
+      role: req.user.role
     })
   } catch (error) {
     return res.status(500).json({ message: error.message })

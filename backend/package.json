@@ -7,7 +7,8 @@
     "test": "cross-env NODE_OPTIONS=--experimental-vm-modules jest --runInBand",
     "dev": "nodemon index.js",
     "start": "node index.js",
-    "lint": "eslint ."
+    "lint": "eslint .",
+    "seed:admin": "node seeder.js"
   },
   "keywords": [],
   "author": "",
@@ -20,7 +21,8 @@
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
     "jsonwebtoken": "^9.0.2",
-    "mongoose": "^8.18.3"
+    "mongoose": "^8.18.3",
+    "nodemailer": "^7.0.9"
   },
   "devDependencies": {
     "@babel/preset-env": "^7.28.3",

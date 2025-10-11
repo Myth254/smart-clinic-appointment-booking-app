@@ -24,6 +24,12 @@ const userSchema = new mongoose.Schema(
       lowercase: true,
       match: [/.+@.+\..+/, 'Invalid email address'],
     },
+    phoneNumber: {
+      type: String,
+      required: [true, 'Phone number is required'],
+      minlength: 10,
+      match: [/^(\+254|0)(7[0-9]|1[0-1])[0-9]{7}$/, 'Invalid phone number'],
+    },
     password: {
       type: String,
       required: [true, 'Password is required'],
@@ -33,10 +39,6 @@ const userSchema = new mongoose.Schema(
       type: String,
       enum: ['patient', 'doctor', 'admin'],
       default: 'patient',
-    },
-    contactInfo: {
-      phone: { type: String },
-      address: { type: String },
     },
   },
   { timestamps: true }
