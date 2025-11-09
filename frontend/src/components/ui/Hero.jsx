@@ -6,11 +6,11 @@ import { useDashboardRedirect } from '../../hooks/useDashboardRedirect';
 const Hero = () => {
   const { isDark } = useTheme();
 
-  const { token, getDashboardPath } = useDashboardRedirect()
+  const { token, getDashboardPath } = useDashboardRedirect();
 
   return (
     <section className={`${isDark ? 'bg-gradient-to-b from-gray-900 to-gray-800' : 'bg-gradient-to-b from-white to-gray-50'} pt-8 md:pt-16 pb-16 transition-colors`}>
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-12 xl:px-16">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="grid md:grid-cols-2 gap-12 items-center">
           <div>
             <h1 className={`text-4xl md:text-5xl font-bold ${isDark ? 'text-white' : 'text-gray-900'} mb-6`}>

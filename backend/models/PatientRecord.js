@@ -2,12 +2,12 @@ import mongoose from 'mongoose'
 
 const patientRecordSchema = new mongoose.Schema(
   {
-    patientId: {
+    patient: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
     },
-    doctorId: {
+    doctor: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
@@ -16,7 +16,7 @@ const patientRecordSchema = new mongoose.Schema(
       type: String,
       maxlength: 1000,
     },
-    appointmentId: {
+    appointment: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Appointment',
     },

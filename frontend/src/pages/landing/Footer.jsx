@@ -6,7 +6,7 @@ const Footer = () => {
 
   return (
     <footer className={`${isDark ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'} border-t py-8 transition-colors`}>
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-12 xl:px-16 text-center">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 text-center">
         <p className={`${isDark ? 'text-gray-400' : 'text-gray-600'}`}>
           © 2025 MediBook. All rights reserved.
         </p>

@@ -8,11 +8,11 @@ const Header = () => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const { isDark, toggleTheme } = useTheme();
 
-  const { user, token, getDashboardPath } = useDashboardRedirect()
+  const { user, token, getDashboardPath } = useDashboardRedirect();
 
-   return (
+  return (
     <header className={`${isDark ? 'bg-gray-900' : 'bg-white'} border-b ${isDark ? 'border-gray-800' : 'border-gray-100'} sticky top-0 z-50 transition-colors`}>
-      <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-12 xl:px-16">
+      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div className="flex justify-between items-center h-16">
           <div className="flex items-center space-x-2">
             <div className={`${isDark ? 'bg-blue-600' : 'bg-gray-900'} p-2 rounded-lg`}>
@@ -68,7 +68,7 @@ const Header = () => {
         </div>
       )}
     </header>
-   );
+  );
 };
 
 export default Header;

@@ -8,11 +8,11 @@ export const useDashboardRedirect = () => {
     if (!token || !user) return '/login'
     switch (user.role) {
       case 'admin':
-        return '/admin-dashboard'
+        return '/admin/dashboard'
       case 'doctor':
-        return '/doctor-dashboard'
+        return '/doctor/dashboard'
       default:
-        return '/dashboard'
+        return '/patient/dashboard'
     }
   }
 

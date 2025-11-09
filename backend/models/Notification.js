@@ -1,32 +1,43 @@
 import mongoose from 'mongoose'
 
-const notificationSchema = new mongoose.Schema(
-  {
-    userId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'User',
-      required: true,
-    },
-    appointmentId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Appointment',
-    },
-    type: {
-      type: String,
-      enum: ['email', 'sms'],
-      required: true,
-    },
-    message: {
-      type: String,
-      required: true,
-    },
-    status: {
-      type: String,
-      enum: ['pending', 'sent', 'failed'],
-      default: 'pending',
-    },
+const notificationSchema = new mongoose.Schema({
+  user: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User',
+    required: true
   },
-  { timestamps: true }
-)
+  type: {
+    type: String,
+    enum: ['appointment', 'reminder', 'cancellation', 'rescheduled', 'message', 'system'],
+    required: true
+  },
+  title: {
+    type: String,
+    required: [true, 'Title is required']
+  },
+  message: {
+    type: String,
+    required: [true, 'Message is required']
+  },
+  read: {
+    type: Boolean,
+    default: false
+  },
+  readAt: Date,
+  data: {
+    type: mongoose.Schema.Types.Mixed
+  },
+  sentAt: {
+    type: Date,
+    default: Date.now
+  }
+}, {
+  timestamps: true
+})
 
-export default mongoose.model('Notification', notificationSchema)
+// Index for efficient queries
+notificationSchema.index({ user: 1, read: 1, sentAt: -1 })
+
+const Notification = mongoose.model('Notification', notificationSchema)
+
+export default Notification
