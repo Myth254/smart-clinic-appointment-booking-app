@@ -118,7 +118,6 @@ export default function Register() {
 
     try {
       setLoading(true)
-<<<<<<< Updated upstream
       
       // Prepare registration data (remove confirmPassword and agreeToTerms)
       const { confirmPassword, agreeToTerms, emergencyContactName, emergencyContactPhone, ...registrationData } = formData
@@ -130,9 +129,6 @@ export default function Register() {
       }
       
       // Call register function from AuthContext
-=======
-      const { ...registrationData } = formData
->>>>>>> Stashed changes
       await register(registrationData)
       
       // ✅ Success - Navigate to login page

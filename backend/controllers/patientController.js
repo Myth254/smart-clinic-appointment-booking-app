@@ -5,8 +5,11 @@ import Doctor from '../models/Doctor.js'
 import Appointment from '../models/Appointment.js'
 import MedicalRecord from '../models/MedicalRecord.js'
 import Notification from '../models/Notification.js'
+import Prescription from '../models/Prescription.js'
+import Bill from '../models/Bill.js'
 import Availability from '../models/Availability.js'
 import { sendAppointmentConfirmation, sendAppointmentCancellation } from '../utils/sendEmail.js'
+import logAudit from '../utils/auditLogger.js'
 
 // @desc    Get patient profile
 // @route   GET /api/patients/:id
@@ -122,6 +125,19 @@ export const updateProfile = async (req, res) => {
       { new: true, runValidators: true }
     )
 
+    await logAudit({
+      userId: id,
+      action: 'PROFILE_UPDATED',
+      resourceType: 'Patient',
+      resourceId: id,
+      details: {
+        updatedFields: Object.keys(req.body),
+        updatedBy: req.user._id
+      },
+      req,
+      status: 'success'
+    })
+
     return res.json({
       message: 'Profile updated successfully',
       user: {
@@ -155,33 +171,50 @@ export const getStats = async (req, res) => {
 
     const now = new Date()
 
-    // Total appointments
-    const totalAppointments = await Appointment.countDocuments({ patient: id })
-
-    // Upcoming appointments
-    const upcomingAppointments = await Appointment.find({
-      patient: id,
-      status: { $in: ['pending', 'approved'] },
-      start: { $gte: now }
-    }).sort({ start: 1 })
-
-    // Completed appointments
-    const completedAppointments = await Appointment.countDocuments({
-      patient: id,
-      status: 'completed'
-    })
-
-    // Cancelled appointments
-    const cancelledAppointments = await Appointment.countDocuments({
-      patient: id,
-      status: 'cancelled'
-    })
-
-    // Medical records count
-    const medicalRecordsCount = await MedicalRecord.countDocuments({ patient: id })
+    const [
+      totalAppointments,
+      upcomingAppointments,
+      completedAppointments,
+      cancelledAppointments,
+      medicalRecordsCount,
+      activePrescriptions,
+      pendingPayments,
+      unreadNotifications
+    ] = await Promise.all([
+      Appointment.countDocuments({ patient: id }),
+      Appointment.find({
+        patient: id,
+        status: { $in: ['pending', 'approved'] },
+        start: { $gte: now }
+      }).sort({ start: 1 }),
+      Appointment.countDocuments({
+        patient: id,
+        status: 'completed'
+      }),
+      Appointment.countDocuments({
+        patient: id,
+        status: 'cancelled'
+      }),
+      MedicalRecord.countDocuments({ patient: id }),
+      Prescription.countDocuments({
+        patient: id,
+        status: { $in: ['new', 'pending_pharmacy', 'ready_for_pickup'] }
+      }),
+      Bill.countDocuments({
+        patient: id,
+        status: { $in: ['pending', 'partially_paid'] }
+      }),
+      Notification.countDocuments({
+        user: id,
+        read: false
+      })
+    ])
 
     // Next appointment
     const nextAppointment = upcomingAppointments[0] || null
+    const nextAppointmentDays = nextAppointment
+      ? Math.max(0, Math.ceil((new Date(nextAppointment.start) - now) / 86400000))
+      : 0
 
     if (nextAppointment) {
       await nextAppointment.populate([
@@ -195,7 +228,11 @@ export const getStats = async (req, res) => {
       completedAppointments,
       cancelledAppointments,
       upcomingCount: upcomingAppointments.length,
+      nextAppointmentDays,
       medicalRecordsCount,
+      activePrescriptions,
+      pendingPayments,
+      unreadNotifications,
       nextAppointment: nextAppointment ? {
         id: nextAppointment._id,
         date: nextAppointment.start,
@@ -443,6 +480,22 @@ export const bookAppointment = async (req, res) => {
       time: appointmentStart.toLocaleTimeString()
     }).catch(err => console.error('Email send error:', err))
 
+    await logAudit({
+      userId: id,
+      action: 'APPOINTMENT_BOOKED',
+      resourceType: 'Appointment',
+      resourceId: appointment._id,
+      details: {
+        doctorId: doctorId,
+        appointmentDate: appointmentStart,
+        reason: reason,
+        type: type,
+        duration: duration
+      },
+      req,
+      status: 'success'
+    })
+
     return res.status(201).json({
       message: 'Appointment booked successfully',
       appointment
@@ -657,6 +710,21 @@ export const cancelAppointment = async (req, res) => {
       time: appointment.start.toLocaleTimeString(),
       reason: reason || 'No reason provided'
     }).catch(err => console.error('Email send error:', err))
+
+    await logAudit({
+      userId: id,
+      action: 'APPOINTMENT_CANCELLED',
+      resourceType: 'Appointment',
+      resourceId: appointmentId,
+      details: {
+        doctorId: appointment.doctor,
+        appointmentDate: appointment.start,
+        cancellationReason: reason,
+        cancelledBy: 'patient'
+      },
+      req,
+      status: 'success'
+    })
 
     return res.json({
       message: 'Appointment cancelled successfully',

@@ -59,11 +59,11 @@ const PatientRecordsTab = ({
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Total Visits
                 </th>
-                <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                {/* <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Conditions
-                </th>
+                </th> */}
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                  Notes
+                  notes
                 </th>
                 <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                   Actions
@@ -108,7 +108,7 @@ const PatientRecordsTab = ({
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
                         {record.totalVisits}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
+                      {/* <td className="px-6 py-4 whitespace-nowrap">
                         {record.conditions.length > 0 ? (
                           record.conditions.map((condition, i) => (
                             <span
@@ -121,7 +121,7 @@ const PatientRecordsTab = ({
                         ) : (
                           <span className="text-sm text-gray-400">-</span>
                         )}
-                      </td>
+                      </td> */}
                       <td className="px-6 py-4 text-sm text-gray-600 max-w-xs truncate">
                         {record.notes || '-'}
                       </td>

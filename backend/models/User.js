@@ -80,6 +80,7 @@ const userSchema = new mongoose.Schema({
       'make_payments',
       'view_lab_results',
       'pickup_prescriptions',
+      'view_own_lab_requests',
 
       // Doctor permissions
       'view_assigned_appointments',
@@ -194,7 +195,6 @@ userSchema.virtual('fullName').get(function() {
 
 // Index for faster queries
 userSchema.index({ role: 1, status: 1 })
-userSchema.index({ email: 1 })
 userSchema.index({ clinicStaffType: 1 })
 userSchema.index({ assignedClinic: 1 })
 
@@ -206,6 +206,7 @@ function getPermissionsByRole(role) {
       'view_own_records',
       'make_payments',
       'view_lab_results',
+      'view_own_lab_requests',
       'pickup_prescriptions'
     ],
     doctor: [

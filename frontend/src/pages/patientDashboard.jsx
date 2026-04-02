@@ -1,218 +1,501 @@
 /* eslint-disable react-hooks/exhaustive-deps */
-import React, { useState, useEffect } from 'react';
-import { Calendar, Bell, FileText, Settings, LogOut, Clock, User, Plus } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
-import { appointmentsAPI, patientAPI, medicalRecordsAPI } from '../api';
-import { format, parseISO } from 'date-fns';
-import toast from 'react-hot-toast';
-import BookAppointmentModal from '../components/forms/BookAppointmentModal';
-import NotificationsModal from '../components/layout/NotificationsModal';
-import SettingsModal from '../components/layout/SettingsModal';
-import RescheduleModal from '../components/forms/RescheduleModal';
+/* eslint-disable no-unused-vars */
+// pages/PatientDashboard.jsx
+/**
+ * PatientDashboard — Refactored (pass 2)
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Changes on top of the previous refactor:
+ *
+ * A. PaymentsTab no longer self-fetches.
+ *    Before: payments tab lazy-loader called `fetchBills()` AND `fetchPrescriptions()`,
+ *            while PaymentsTab also called `billingAPI.getMyBills()` internally
+ *            on mount — 2 hits to /billing/bills/my-bills per tab visit.
+ *    After:  `bills` and `loading` are passed as props. The "Refresh" button
+ *            delegates to `fetchBills` via the new `onRefresh` prop.
+ *            The lazy-loader only calls `fetchBills()` once (guard still applies).
+ *
+ * B. ActiveConsultationBanner no longer polls socket status or registers
+ *    its own session:progress listener.
+ *    Before: Banner had setInterval(checkConnection, 1_000) → 60 state updates/min,
+ *            plus its own onSessionProgress listener duplicating the dashboard's.
+ *    After:  Banner receives `isConnected` and `recentUpdate` as props.
+ *            The dashboard owns the single 1-second connection check interval
+ *            (already present) and manages recentUpdate state.
+ *
+ * C. PrescriptionsTab no longer registers socket listeners.
+ *    Before: PrescriptionsTab subscribed to prescription:confirmed/ready/
+ *            dispensed/alternative_suggested independently.
+ *    After:  It only receives `highlightedPrescriptions` as a prop (Set<id>),
+ *            managed entirely by the socket handlers below.
+ *
+ * All other fixes from pass 1 are preserved unchanged.
+ */
 
-const PatientDashboard = () => {
-  const { user, logout } = useAuth();
-  const [activeTab, setActiveTab] = useState('overview');
-  const [loading, setLoading] = useState(false);
-  
-  // Modal states
-  const [showNotifications, setShowNotifications] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [showRescheduleModal, setShowRescheduleModal] = useState(false);
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import {
+  Calendar, Bell, LogOut, Plus, Activity,
+  Pill, CreditCard, Clock, FileText,
+} from 'lucide-react';
+import { format, parseISO } from 'date-fns';
+import { useAuth } from '../context/AuthContext';
+import { ConsultationProvider } from '../context/ConsultationContext';
+import { useNotifications } from '../context/NotificationContext';
+import {
+  medicalRecordsAPI, patientAPI, pharmacyAPI, billingAPI,
+} from '../api';
+import { useAppointments } from '../hooks/Useappointments';
+import toast from 'react-hot-toast';
+import socketService from '../services/socketService';
+
+import StatsCards                from '../components/patient/stats/StatsCards';
+import OverviewTab               from '../components/patient/OverviewTab';
+import PrescriptionsTab          from '../components/patient/PrescriptionsTab';
+import PaymentsTab               from '../components/patient/PaymentsTab';
+import HistoryTab                from '../components/patient/HistoryTab';
+import CriticalResultsAlert      from '../components/patient/CriticalResultsAlert';
+import ActiveConsultationBanner  from '../components/patient/ActiveConsultationBanner';
+import PaymentVerificationModal  from '../components/modals/PaymentVerificationModal';
+import { FollowUpsList }         from '../components/patient/FollowUpBookingWidget';
+import AppointmentReminderSystem from '../components/patient/AppointmentReminderSystem';
+import BookAppointmentModal      from '../components/forms/BookAppointmentModal';
+import NotificationsModal        from '../components/layout/NotificationsModal';
+import SettingsModal             from '../components/layout/SettingsModal';
+import RescheduleModal           from '../components/forms/RescheduleModal';
+import PrescriptionDetailModal   from '../components/modals/PrescriptionDetailModal';
+import MedicalRecordDetailModal  from '../components/modals/MedicalRecordDetailModal';
+import { appointmentsAPI }       from '../api';
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ConnectionStatusBadge = ({ isConnected }) => (
+  <div className={`flex items-center space-x-2 px-3 py-1 rounded-full text-xs font-medium ${
+    isConnected
+      ? 'bg-green-50 text-green-700 border border-green-200'
+      : 'bg-red-50 text-red-700 border border-red-200'
+  }`}>
+    <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+    <span>{isConnected ? 'Live' : 'Offline'}</span>
+  </div>
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PatientDashboardContent = () => {
+  const { user, logout }  = useAuth();
+  const { unreadCount }   = useNotifications(); // shared context — no extra poll
+
+  const [activeTab, setActiveTab]             = useState('overview');
+  const [loading,   setLoading]               = useState(false);
+  const [socketConnected, setSocketConnected] = useState(false);
+  // B. recentUpdate replaces Banner's internal state — managed here so the
+  //    single session:progress handler in the socket useEffect can set it.
+  const [recentUpdate, setRecentUpdate]       = useState(null);
+  const recentUpdateTimerRef                  = useRef(null);
+
+  // Modals
+  const [showNotifications,  setShowNotifications]  = useState(false);
+  const [showSettings,       setShowSettings]        = useState(false);
+  const [showRescheduleModal,setShowRescheduleModal] = useState(false);
+  const [showPaymentModal,   setShowPaymentModal]    = useState(false);
   const [selectedAppointmentForReschedule, setSelectedAppointmentForReschedule] = useState(null);
-  
-  // State
-  const [appointments, setAppointments] = useState([]);
-  const [appointmentHistory, setAppointmentHistory] = useState([]);
+  const [selectedMedicalRecord,  setSelectedMedicalRecord]  = useState(null);
+  const [selectedPrescription,   setSelectedPrescription]   = useState(null);
+  const [paymentData,            setPaymentData]            = useState(null);
+  const [statsLoading,           setStatsLoading]           = useState(true);
+  const [highlightedPrescriptions, setHighlightedPrescriptions] = useState(new Set());
+
+  // Data
   const [medicalRecords, setMedicalRecords] = useState([]);
+  const [labRequests,    setLabRequests]    = useState([]);
+  const [prescriptions,  setPrescriptions]  = useState([]);
+  const [bills,          setBills]          = useState([]);
+  const [billsLoading,   setBillsLoading]   = useState(false);
   const [stats, setStats] = useState({
-    upcomingAppointments: 0,
-    nextAppointmentDays: 0,
-    totalVisits: 0,
-    unreadNotifications: 0
+    upcomingAppointments: 0, nextAppointmentDays: 0,
+    totalVisits: 0, unreadNotifications: 0,
+    activePrescriptions: 0, pendingPayments: 0,
   });
 
-  // ✅ Fixed: Consolidated useEffect - fetch on mount and tab change
-  useEffect(() => {
-    fetchAppointments();
-    fetchUnreadCount();
-    
-    // Fetch records only when 'records' tab is active
-    if (activeTab === 'records') {
-      fetchMedicalRecords();
+  // Centralised appointment fetching via hook
+  const {
+    all: allAppointments,
+    upcoming: appointments,
+    history: appointmentHistory,
+    refresh: refreshAppointments,
+  } = useAppointments();
+
+  // Track which tabs have been loaded at least once — prevent re-fetch on revisit
+  const tabLoadedRef    = useRef({});
+  const statsTimeoutRef = useRef(null);
+
+  // ── Stats ─────────────────────────────────────────────────────────────────
+  const fetchStats = useCallback(async () => {
+    if (!user?._id) { setStatsLoading(false); return; }
+    setStatsLoading(true);
+    try {
+      const data = await patientAPI.getStats(user._id);
+      setStats({
+        upcomingAppointments: data.upcomingCount         ?? 0,
+        nextAppointmentDays:  data.nextAppointmentDays   ?? 0,
+        totalVisits:          data.completedAppointments ?? 0,
+        activePrescriptions:  data.activePrescriptions   ?? 0,
+        pendingPayments:      data.pendingPayments        ?? 0,
+        unreadNotifications:  data.unreadNotifications    ?? 0,
+      });
+    } catch (err) {
+      console.error('fetchStats error:', err);
+    } finally {
+      setStatsLoading(false);
     }
-  }, [activeTab]);
+  }, [user?._id]);
 
-  // Calculate stats when appointments change
-  useEffect(() => {
-    const calculateStats = () => {
-      const upcomingCount = appointments.length;
-      let nextDays = 0;
-      
-      if (appointments.length > 0) {
-        const sortedAppts = [...appointments].sort((a, b) => new Date(a.start) - new Date(b.start));
-        const nextAppt = sortedAppts[0];
-        const diffTime = new Date(nextAppt.start) - new Date();
-        nextDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-      }
+  const debouncedFetchStats = useCallback(() => {
+    clearTimeout(statsTimeoutRef.current);
+    statsTimeoutRef.current = setTimeout(fetchStats, 400);
+  }, [fetchStats]);
 
-      setStats(prev => ({
-        ...prev,
-        upcomingAppointments: upcomingCount,
-        nextAppointmentDays: nextDays,
-        totalVisits: appointmentHistory.filter(a => a.status === 'completed').length,
-      }));
-    };
-    calculateStats();
-  }, [appointments, appointmentHistory]);
+  // ── Data fetchers (stable references) ────────────────────────────────────
+  const fetchBills = useCallback(async () => {
+    try {
+      setBillsLoading(true);
+      const res = await billingAPI.getMyBills();
+      setBills(res.data ?? []);
+    } catch (err) {
+      if (err?.response?.status !== 404) console.error('Fetch bills error:', err);
+      setBills([]);
+    } finally {
+      setBillsLoading(false);
+    }
+  }, []);
 
-  const fetchMedicalRecords = async () => {
+  const fetchMedicalRecords = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await medicalRecordsAPI.getMyRecords();
-      setMedicalRecords(response.data || []);
-    } catch (error) {
-      console.error('Failed to fetch medical records:', error);
+      const res = await medicalRecordsAPI.getMyRecords();
+      const records = res.data ?? [];
+      setMedicalRecords(records);
+      // Derive lab requests from already-fetched records — no extra API call
+      const labResults = records.flatMap((r) => r.resolvedLabResults ?? []);
+      setLabRequests(labResults);
+    } catch (err) {
       toast.error('Failed to load medical records');
     } finally {
       setLoading(false);
     }
-  };
+  }, []);
 
-  const fetchAppointments = async () => {
+  const fetchPrescriptions = useCallback(async () => {
     try {
       setLoading(true);
-      const response = await appointmentsAPI.getAppointments();
-
-      const payload = response.data || response;
-      const data = Array.isArray(payload)
-        ? payload
-        : (payload.appointments || []);
-
-      // ✅ DEBUG: Log the first appointment to see structure
-      if (data.length > 0) {
-        console.log('=== APPOINTMENT DATA STRUCTURE ===');
-        console.log('First appointment:', data[0]);
-        console.log('Doctor object:', data[0].doctor);
-        console.log('Doctor specialization:', data[0].doctor?.specialization);
-        console.log('================================');
-      }
-
-      const now = new Date();
-      const upcoming = data.filter(apt =>
-        ['pending', 'approved'].includes(apt.status) &&
-        new Date(apt.start) > now
-      );
-      const history = data.filter(apt =>
-        apt.status === 'completed' ||
-        apt.status === 'cancelled' ||
-        new Date(apt.start) <= now
-      );
-
-      setAppointments(upcoming);
-      setAppointmentHistory(history);
-    } catch (error) {
-      toast.error('Failed to fetch appointments');
-      console.error(error);
+      const res = await pharmacyAPI.getPrescriptions();
+      setPrescriptions(res.data ?? []);
+    } catch (err) {
+      toast.error('Failed to load prescriptions');
     } finally {
       setLoading(false);
     }
+  }, []);
+
+  // ── Bootstrap on mount ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!user?._id) return;
+    refreshAppointments();
+    fetchStats();
+    fetchBills();
+    tabLoadedRef.current['overview'] = true;
+  }, [user?._id]);
+
+  // ── Lazy tab loading — fetch only when tab first visited ─────────────────
+  useEffect(() => {
+    if (tabLoadedRef.current[activeTab]) return; // already loaded
+    tabLoadedRef.current[activeTab] = true;
+
+    if (activeTab === 'records') {
+      fetchMedicalRecords();
+    } else if (activeTab === 'prescriptions') {
+      fetchPrescriptions();
+    }
+    // 'payments' no longer needs to self-fetch — bills are fetched on mount
+    // and refreshed via the Refresh button (onRefresh prop) when needed.
+  }, [activeTab]);
+
+  useEffect(() => () => {
+    clearTimeout(statsTimeoutRef.current);
+    clearTimeout(recentUpdateTimerRef.current);
+  }, []);
+
+  // ── Socket setup ──────────────────────────────────────────────────────────
+  // Dep array uses `user?.role` (primitive) not `user` (object) — prevents
+  // re-registration on every render when user reference changes.
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (!token || user?.role !== 'patient') return;
+
+    socketService.connect(token);
+
+    // Single interval for connection status — owned here, not in Banner
+    const checkConnection = setInterval(
+      () => setSocketConnected(socketService.getConnectionStatus()),
+      1_000
+    );
+
+    const handleSessionStarted = (data) => {
+      toast.success(`Dr. ${data.doctor?.name || 'Your doctor'} has started your consultation`, {
+        duration: 5000, icon: '👨‍⚕️',
+      });
+      refreshAppointments();
+      debouncedFetchStats();
+    };
+
+    const handleBillCreated = (data) => {
+      toast.info(`Your consultation bill is ready (${data.billNumber})`, { duration: 4000, icon: '🧾' });
+      fetchBills();
+      debouncedFetchStats();
+    };
+
+    // B. session:progress now updates recentUpdate state (passed to Banner as prop)
+    //    instead of being handled inside Banner itself.
+    const handleSessionProgress = (data) => {
+      toast.info(data.message, { duration: 3000 });
+      // Show update bubble in Banner for 5 s
+      clearTimeout(recentUpdateTimerRef.current);
+      setRecentUpdate({ message: data.message, timestamp: new Date() });
+      recentUpdateTimerRef.current = setTimeout(() => setRecentUpdate(null), 5_000);
+    };
+
+    const handleSessionCompleted = (data) => {
+      toast.success('Your consultation has been completed', { duration: 5000, icon: '✅' });
+      setRecentUpdate(null);
+      refreshAppointments();
+      fetchMedicalRecords();
+      debouncedFetchStats();
+    };
+
+    const handleSessionCancelled = (data) => {
+      toast.error(`Session ended: ${data.reason}`, { duration: 6000 });
+      setRecentUpdate(null);
+      refreshAppointments();
+    };
+
+    const handleLabRequestCreated = (data) => {
+      toast.info(`Lab tests ordered: ${data.tests?.join(', ') || 'Tests'}`, { duration: 5000, icon: '🧪' });
+      tabLoadedRef.current['records'] = false;
+      if (activeTab === 'records') fetchMedicalRecords();
+    };
+
+    const handleLabStatusChanged = (data) => {
+      const msgs = {
+        assigned:           'Lab tests assigned to technician',
+        specimen_collected: 'Specimen collected',
+        processing:         'Lab tests in progress',
+        completed:          'Lab results ready!',
+      };
+      if (msgs[data.status]) {
+        toast.info(msgs[data.status], { duration: 4000, icon: '🧪' });
+        tabLoadedRef.current['records'] = false;
+        if (activeTab === 'records') fetchMedicalRecords();
+      }
+    };
+
+    const handleLabResultsAvailable = (data) => {
+      toast.success('Your lab results are now available!', { duration: 6000, icon: '📊' });
+      if (data.hasCriticalResults)
+        toast.error('⚠️ CRITICAL: Some results require immediate attention.', { duration: 10000 });
+      tabLoadedRef.current['records'] = false;
+      if (activeTab === 'records') fetchMedicalRecords();
+    };
+
+    // C. Prescription highlight helper — only managed here, not in PrescriptionsTab
+    const highlightPrescription = (id) => {
+      setHighlightedPrescriptions((prev) => new Set([...prev, id]));
+      setTimeout(() => {
+        setHighlightedPrescriptions((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }, 3_000);
+    };
+
+    const handlePrescriptionConfirmed = (data) => {
+      toast.info(`Prescription #${data.prescriptionNumber}: Medications confirmed`, { duration: 4000, icon: '💊' });
+      tabLoadedRef.current['prescriptions'] = false;
+      fetchPrescriptions();
+      highlightPrescription(data.prescriptionId);
+      debouncedFetchStats();
+    };
+
+    const handlePrescriptionReady = (data) => {
+      toast.success('Your prescription is ready for pickup!', { duration: 8000, icon: '🏪' });
+      fetchPrescriptions();
+      highlightPrescription(data.prescriptionId);
+      debouncedFetchStats();
+    };
+
+    const handlePrescriptionDispensed = (data) => {
+      toast.success(`Prescription #${data.prescriptionNumber} has been dispensed`, { duration: 5000, icon: '✅' });
+      fetchPrescriptions();
+      highlightPrescription(data.prescriptionId);
+      debouncedFetchStats();
+    };
+
+    const handlePaymentSuccessSocket = (data) => {
+      toast.success(
+        `Payment of KES ${data.amount?.toLocaleString() || data.amount} successful!`,
+        { duration: 5000, icon: '✅' }
+      );
+      fetchBills();
+      debouncedFetchStats();
+      if (data.type === 'prescription') fetchPrescriptions();
+    };
+
+    const handlePaymentPending = () =>
+      toast.info('Payment is being processed...', { duration: 4000, icon: '⏳' });
+
+    socketService.onSessionStarted(handleSessionStarted);
+    socketService.socket?.on('session:bill_created', handleBillCreated);
+    socketService.onSessionProgress(handleSessionProgress);
+    socketService.onSessionCompleted(handleSessionCompleted);
+    socketService.onSessionCancelled(handleSessionCancelled);
+    socketService.onLabRequestCreated(handleLabRequestCreated);
+    socketService.onLabStatusChanged(handleLabStatusChanged);
+    socketService.onLabResultsAvailable(handleLabResultsAvailable);
+    socketService.onPrescriptionConfirmed(handlePrescriptionConfirmed);
+    socketService.onPrescriptionReady(handlePrescriptionReady);
+    socketService.onPrescriptionDispensed(handlePrescriptionDispensed);
+    socketService.onPaymentSuccess(handlePaymentSuccessSocket);
+    socketService.onPaymentPending(handlePaymentPending);
+
+    return () => {
+      clearInterval(checkConnection);
+      clearTimeout(statsTimeoutRef.current);
+      clearTimeout(recentUpdateTimerRef.current);
+      socketService.removeAllListeners('session:started');
+      socketService.removeAllListeners('session:progress');
+      socketService.removeAllListeners('session:completed');
+      socketService.removeAllListeners('session:cancelled');
+      socketService.removeAllListeners('session:bill_created');
+      socketService.removeAllListeners('lab:request_created');
+      socketService.removeAllListeners('lab:status_changed');
+      socketService.removeAllListeners('lab:results_available');
+      socketService.removeAllListeners('prescription:confirmed');
+      socketService.removeAllListeners('prescription:ready');
+      socketService.removeAllListeners('prescription:dispensed');
+      socketService.removeAllListeners('payment:success');
+      socketService.removeAllListeners('payment:pending');
+    };
+  }, [user?.role]); // primitive dep — re-registers only when role changes
+
+  useEffect(() => () => { if (!user) socketService.disconnect(); }, [user]);
+
+  // ── Action handlers ───────────────────────────────────────────────────────
+  const handlePaymentInitiation = (item, type) => {
+    if (type === 'bill' || item.billId) {
+      setPaymentData({
+        billId:      item.billId || item._id,
+        amount:      item.amount || item.balanceDue,
+        billNumber:  item.billNumber,
+        description: item.description || item.sessionRef,
+        itemDetails: item.itemDetails,
+        defaultPhone: user?.phoneNumber,
+      });
+    } else {
+      setPaymentData({
+        amount:      item.estimatedCost || item.actualCost,
+        referenceId: item._id,
+        type,
+        description: type === 'lab'
+          ? `Lab Test #${item.requestNumber}`
+          : `Prescription #${item.prescriptionNumber}`,
+        itemDetails: type === 'lab'
+          ? `${item.tests?.length || 0} test(s)`
+          : `${item.medications?.length || 0} medication(s)`,
+        defaultPhone: user?.phoneNumber,
+      });
+    }
+    setShowPaymentModal(true);
   };
 
-  const fetchUnreadCount = async () => {
-    try {
-      if (!user?.id) return; // ✅ Changed from user?._id to user?.id (normalized)
-      const response = await patientAPI.getUnreadCount(user.id);
-      setStats(prev => ({
-        ...prev,
-        unreadNotifications: response.unreadCount || 0
-      }));
-    } catch (error) {
-      console.error('Failed to fetch unread count:', error);
-    }
+  const handlePaymentSuccess = async () => {
+    toast.success('Payment completed successfully!');
+    await fetchBills();
+    await fetchStats();
+    if (activeTab === 'prescriptions' || activeTab === 'payments') await fetchPrescriptions();
   };
 
   const handleCancelAppointment = async (appointmentId) => {
     if (!window.confirm('Are you sure you want to cancel this appointment?')) return;
-
     try {
       setLoading(true);
       await appointmentsAPI.cancelAppointment(appointmentId, 'Cancelled by patient');
       toast.success('Appointment cancelled successfully');
-      fetchAppointments();
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to cancel appointment');
+      await Promise.all([refreshAppointments(), fetchStats()]);
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to cancel appointment');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleRescheduleClick = (appointment) => {
-    setSelectedAppointmentForReschedule(appointment);
-    setShowRescheduleModal(true);
-  };
-
-  const handleRescheduleSubmit = async (newSlot) => {
+  const handleReschedule = async (newSlot) => {
     try {
       setLoading(true);
-      await appointmentsAPI.rescheduleAppointment(
-        selectedAppointmentForReschedule._id,
-        {
-          newStart: new Date(newSlot.start).toISOString(),
-          newEnd: new Date(newSlot.end).toISOString(),
-          reason: 'Patient requested reschedule'
-        }
-      );
+      await appointmentsAPI.rescheduleAppointment(selectedAppointmentForReschedule._id, {
+        newStart: new Date(newSlot.start).toISOString(),
+        newEnd:   new Date(newSlot.end).toISOString(),
+        reason:   'Patient requested reschedule',
+      });
       toast.success('Appointment rescheduled successfully');
       setShowRescheduleModal(false);
       setSelectedAppointmentForReschedule(null);
-      fetchAppointments();
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to reschedule');
+      await Promise.all([refreshAppointments(), fetchStats()]);
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to reschedule');
     } finally {
       setLoading(false);
     }
   };
 
-  const handleNotificationsClick = () => {
-    setShowNotifications(true);
+  const handleFollowUpBook = (appointment) => {
+    setActiveTab('book');
+    sessionStorage.setItem('followUpContext', JSON.stringify({
+      followUpOf:    appointment._id,
+      doctorId:      appointment.doctor?._id || appointment.doctor?.userId?._id,
+      suggestedDate: appointment.followUpDate,
+      reason:        appointment.followUpReason
+        ? `Follow-up for: ${appointment.followUpReason}`
+        : 'Follow-up appointment requested by your doctor.',
+    }));
   };
 
-  const handleSettingsClick = () => {
-    setShowSettings(true);
-  };
-
-  const handleModalClose = (modalType) => {
-    if (modalType === 'notifications') {
-      setShowNotifications(false);
-      fetchUnreadCount();
-    } else if (modalType === 'settings') {
-      setShowSettings(false);
-    } else if (modalType === 'reschedule') {
-      setShowRescheduleModal(false);
-      setSelectedAppointmentForReschedule(null);
-    }
-  };
-
-  const formatDate = (dateString) => {
+  const handleFollowUpDismiss = async (appointment) => {
     try {
-      return format(parseISO(dateString), 'EEE, MMM d');
-    } catch {
-      return dateString;
+      await appointmentsAPI.dismissFollowUpReminder(appointment._id);
+      toast.success('Follow-up reminder dismissed');
+      refreshAppointments();
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to dismiss follow-up reminder');
     }
   };
 
-  const formatTime = (dateString) => {
-    try {
-      return format(parseISO(dateString), 'h:mm a');
-    } catch {
-      return dateString;
-    }
-  };
+  // ── Derived ───────────────────────────────────────────────────────────────
+  const pendingFollowUps = allAppointments.filter(
+    (a) => a.isFollowUpRequired && a.activeFollowUpReminder?.status === 'active'
+  );
+
+  const tabs = [
+    { id: 'overview',      label: 'Overview',         icon: Activity   },
+    { id: 'book',          label: 'Book Appointment', icon: Plus       },
+    { id: 'records',       label: 'Medical Records',  icon: FileText   },
+    { id: 'prescriptions', label: 'Prescriptions',    icon: Pill       },
+    { id: 'payments',      label: 'Payments',         icon: CreditCard },
+    { id: 'history',       label: 'History',          icon: Clock      },
+  ];
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Header */}
+      <CriticalResultsAlert />
+
       <header className="bg-white border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
@@ -221,20 +504,23 @@ const PatientDashboard = () => {
                 <Calendar className="w-5 h-5 text-white" />
               </div>
               <span className="text-xl font-semibold">MediBook</span>
+              <ConnectionStatusBadge isConnected={socketConnected} />
             </div>
 
             <div className="flex items-center space-x-4">
-              <button 
-                onClick={handleNotificationsClick}
+              <button
+                onClick={() => setShowNotifications(true)}
                 className="p-2 hover:bg-gray-100 rounded-lg relative"
               >
                 <Bell className="w-5 h-5" />
-                {stats.unreadNotifications > 0 && (
+                {/* Use shared context unreadCount — no extra API call */}
+                {unreadCount > 0 && (
                   <span className="absolute top-1 right-1 w-5 h-5 bg-red-500 rounded-full flex items-center justify-center text-white text-xs font-medium">
-                    {stats.unreadNotifications > 9 ? '9+' : stats.unreadNotifications}
+                    {unreadCount > 9 ? '9+' : unreadCount}
                   </span>
                 )}
               </button>
+
               <div className="flex items-center space-x-3">
                 <div className="text-right">
                   <div className="text-sm font-medium">{user?.firstName} {user?.lastName}</div>
@@ -244,10 +530,8 @@ const PatientDashboard = () => {
                   {user?.firstName?.[0]}{user?.lastName?.[0]}
                 </div>
               </div>
-              <button 
-                onClick={logout}
-                className="p-2 hover:bg-gray-100 rounded-lg flex items-center space-x-2"
-              >
+
+              <button onClick={logout} className="p-2 hover:bg-gray-100 rounded-lg flex items-center space-x-2">
                 <LogOut className="w-5 h-5" />
                 <span className="text-sm">Logout</span>
               </button>
@@ -256,380 +540,151 @@ const PatientDashboard = () => {
         </div>
       </header>
 
-      {/* Navigation - ✅ Fixed: Added 'records' tab */}
       <div className="bg-white border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <nav className="flex space-x-8">
-            {[
-              { id: 'overview', label: 'Overview' },
-              { id: 'book', label: 'Book Appointment' },
-              { id: 'records', label: 'Medical Records' },
-              { id: 'history', label: 'History' }
-            ].map(tab => (
-              <button
-                key={tab.id}
-                onClick={() => setActiveTab(tab.id)}
-                className={`py-4 px-1 border-b-2 font-medium text-sm ${
-                  activeTab === tab.id
-                    ? 'border-black text-black'
-                    : 'border-transparent text-gray-500 hover:text-gray-700'
-                }`}
-              >
-                {tab.label}
-              </button>
-            ))}
+          <nav className="flex space-x-8 overflow-x-auto">
+            {tabs.map((tab) => {
+              const Icon = tab.icon;
+              return (
+                <button
+                  key={tab.id}
+                  onClick={() => setActiveTab(tab.id)}
+                  className={`py-4 px-1 border-b-2 font-medium text-sm flex items-center space-x-2 whitespace-nowrap ${
+                    activeTab === tab.id
+                      ? 'border-black text-black'
+                      : 'border-transparent text-gray-500 hover:text-gray-700'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" />
+                  <span>{tab.label}</span>
+                </button>
+              );
+            })}
           </nav>
         </div>
       </div>
 
-      {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {/* B. Pass isConnected + recentUpdate props — Banner no longer polls/subscribes */}
+        <ActiveConsultationBanner
+          onViewDetails={() => {}}
+          isConnected={socketConnected}
+          recentUpdate={recentUpdate}
+        />
+
+        <AppointmentReminderSystem appointments={allAppointments} />
+
+        {pendingFollowUps.length > 0 && activeTab === 'overview' && (
+          <FollowUpsList
+            appointments={pendingFollowUps}
+            onBook={handleFollowUpBook}
+            onDismiss={handleFollowUpDismiss}
+          />
+        )}
+
         {activeTab === 'overview' && (
           <div className="space-y-6">
-            {/* Stats Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              <div className="bg-white rounded-lg border border-gray-200 p-6">
-                <div className="flex justify-between items-start mb-4">
-                  <h3 className="text-gray-600 text-sm font-medium">Upcoming Appointments</h3>
-                  <Calendar className="w-5 h-5 text-gray-400" />
-                </div>
-                <div className="space-y-1">
-                  <p className="text-3xl font-bold">{stats.upcomingAppointments}</p>
-                  <p className="text-sm text-gray-500">
-                    {stats.upcomingAppointments > 0 
-                      ? `Next appointment in ${stats.nextAppointmentDays} days`
-                      : 'No upcoming appointments'}
-                  </p>
-                </div>
-              </div>
-
-              <div className="bg-white rounded-lg border border-gray-200 p-6">
-                <div className="flex justify-between items-start mb-4">
-                  <h3 className="text-gray-600 text-sm font-medium">Total Visits</h3>
-                  <FileText className="w-5 h-5 text-gray-400" />
-                </div>
-                <div className="space-y-1">
-                  <p className="text-3xl font-bold">{stats.totalVisits}</p>
-                  <p className="text-sm text-gray-500">Completed appointments</p>
-                </div>
-              </div>
-
-              <div className="bg-white rounded-lg border border-gray-200 p-6 cursor-pointer hover:bg-gray-50" onClick={handleNotificationsClick}>
-                <div className="flex justify-between items-start mb-4">
-                  <h3 className="text-gray-600 text-sm font-medium">Notifications</h3>
-                  <Bell className="w-5 h-5 text-gray-400" />
-                </div>
-                <div className="space-y-1">
-                  <p className="text-3xl font-bold">{stats.unreadNotifications}</p>
-                  <p className="text-sm text-gray-500">Unread reminders</p>
-                </div>
-              </div>
-            </div>
-
-            {/* Upcoming Appointments */}
-            <div className="bg-white rounded-lg border border-gray-200">
-              <div className="p-6 border-b border-gray-200">
-                <div className="flex justify-between items-center">
-                  <div>
-                    <h2 className="text-lg font-semibold">Upcoming Appointments</h2>
-                    <p className="text-sm text-gray-500">Your scheduled appointments</p>
-                  </div>
-                  <button
-                    onClick={() => setActiveTab('book')}
-                    className="bg-black text-white px-4 py-2 rounded-lg flex items-center space-x-2 hover:bg-gray-800"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>Book New</span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="divide-y divide-gray-200">
-                {loading && appointments.length === 0 ? (
-                  <div className="p-12 text-center text-gray-500">Loading appointments...</div>
-                ) : appointments.length === 0 ? (
-                  <div className="p-12 text-center text-gray-500">
-                    No upcoming appointments. Book one to get started!
-                  </div>
-                ) : (
-                  appointments.map((appointment) => (
-                    <div key={appointment._id} className="p-6 hover:bg-gray-50">
-                      <div className="flex items-start justify-between">
-                        <div className="flex space-x-4">
-                          <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center">
-                            <User className="w-6 h-6 text-gray-600" />
-                          </div>
-                          <div className="space-y-1">
-                            <h3 className="font-medium">
-                              Dr. {appointment.doctor?.firstName} {appointment.doctor?.lastName}
-                            </h3>
-                            <p className="text-sm text-gray-600">{appointment.doctor?.specialization}</p>
-                            <div className="flex items-center space-x-4 text-sm text-gray-500">
-                              <div className="flex items-center space-x-1">
-                                <Calendar className="w-4 h-4" />
-                                <span>{formatDate(appointment.start)}</span>
-                              </div>
-                              <div className="flex items-center space-x-1">
-                                <Clock className="w-4 h-4" />
-                                <span>{formatTime(appointment.start)}</span>
-                              </div>
-                            </div>
-                            {appointment.reason && (
-                              <p className="text-sm text-gray-600 mt-2">Reason: {appointment.reason}</p>
-                            )}
-                          </div>
-                        </div>
-                        <div className="flex items-center space-x-2">
-                          <span className={`px-3 py-1 text-xs font-medium rounded-full ${
-                            appointment.status === 'approved' 
-                              ? 'bg-green-100 text-green-800'
-                              : 'bg-yellow-100 text-yellow-800'
-                          }`}>
-                            {appointment.status}
-                          </span>
-                          <button
-                            onClick={() => handleRescheduleClick(appointment)}
-                            disabled={loading}
-                            className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50 disabled:opacity-50"
-                          >
-                            Reschedule
-                          </button>
-                          <button
-                            onClick={() => handleCancelAppointment(appointment._id)}
-                            disabled={loading}
-                            className="px-4 py-2 border border-red-300 text-red-600 rounded-lg text-sm hover:bg-red-50 disabled:opacity-50"
-                          >
-                            Cancel
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  ))
-                )}
-              </div>
-            </div>
-
-            {/* Quick Actions */}
-            <div className="bg-white rounded-lg border border-gray-200 p-6">
-              <h2 className="text-lg font-semibold mb-4">Quick Actions</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <button
-                  onClick={() => setActiveTab('book')}
-                  className="flex items-center space-x-3 p-4 border border-gray-200 rounded-lg hover:bg-gray-50"
-                >
-                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                    <Calendar className="w-5 h-5" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-medium">Book Appointment</div>
-                    <div className="text-sm text-gray-500">Schedule a new visit</div>
-                  </div>
-                </button>
-
-                <button
-                  onClick={() => setActiveTab('records')}
-                  className="flex items-center space-x-3 p-4 border border-gray-200 rounded-lg hover:bg-gray-50"
-                >
-                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                    <FileText className="w-5 h-5" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-medium">View Records</div>
-                    <div className="text-sm text-gray-500">Access medical history</div>
-                  </div>
-                </button>
-
-                <button 
-                  onClick={handleNotificationsClick}
-                  className="flex items-center space-x-3 p-4 border border-gray-200 rounded-lg hover:bg-gray-50"
-                >
-                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                    <Bell className="w-5 h-5" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-medium">Notifications</div>
-                    <div className="text-sm text-gray-500">Manage reminders</div>
-                  </div>
-                </button>
-
-                <button 
-                  onClick={handleSettingsClick}
-                  className="flex items-center space-x-3 p-4 border border-gray-200 rounded-lg hover:bg-gray-50"
-                >
-                  <div className="w-10 h-10 bg-gray-100 rounded-lg flex items-center justify-center">
-                    <Settings className="w-5 h-5" />
-                  </div>
-                  <div className="text-left">
-                    <div className="font-medium">Settings</div>
-                    <div className="text-sm text-gray-500">Update your profile</div>
-                  </div>
-                </button>
-              </div>
-            </div>
+            <StatsCards stats={stats} statsLoading={statsLoading} onCardClick={setActiveTab} />
+            <OverviewTab
+              appointments={appointments}
+              loading={loading}
+              onBookNew={() => setActiveTab('book')}
+              onReschedule={(apt) => {
+                setSelectedAppointmentForReschedule(apt);
+                setShowRescheduleModal(true);
+              }}
+              onCancel={handleCancelAppointment}
+              onViewRecords={() => setActiveTab('records')}
+              onViewNotifications={() => setShowNotifications(true)}
+              onViewSettings={() => setShowSettings(true)}
+            />
           </div>
         )}
 
         {activeTab === 'book' && (
           <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <BookAppointmentModal onSuccess={fetchAppointments} />
+            <BookAppointmentModal
+              onSuccess={async () => { await Promise.all([refreshAppointments(), fetchStats()]); }}
+            />
           </div>
         )}
 
         {activeTab === 'records' && (
-          <div className="bg-white rounded-lg border border-gray-200">
-            <div className="p-6 border-b border-gray-200">
-              <h2 className="text-lg font-semibold">Medical Records</h2>
-              <p className="text-sm text-gray-500">Your medical history and diagnoses</p>
-            </div>
-            
-            {loading && medicalRecords.length === 0 ? (
-              <div className="p-12 text-center text-gray-500">Loading records...</div>
-            ) : medicalRecords.length === 0 ? (
-              <div className="p-12 text-center text-gray-500">
-                <FileText className="w-12 h-12 mx-auto mb-3 text-gray-300" />
-                <p className="font-medium">No medical records yet</p>
-                <p className="text-xs mt-1">Records will appear here after completed appointments</p>
-              </div>
-            ) : (
-              <div className="divide-y divide-gray-200">
-                {medicalRecords.map((record) => (
-                  <div key={record._id} className="p-6 hover:bg-gray-50">
-                    <div className="flex items-start justify-between">
-                      <div className="space-y-2 flex-1">
-                        <div className="flex items-center space-x-2">
-                          <h3 className="font-medium text-gray-900">
-                            {record.diagnosis}
-                          </h3>
-                          <span className="text-sm text-gray-500">
-                            {format(parseISO(record.createdAt), 'MMM d, yyyy')}
-                          </span>
-                        </div>
-                        
-                        <p className="text-sm text-gray-600">
-                          Dr. {record.doctor?.userId?.firstName || record.doctor?.firstName} {record.doctor?.userId?.lastName || record.doctor?.lastName}
-                        </p>
-                        
-                        {record.prescription && record.prescription.length > 0 && (
-                          <div className="mt-2">
-                            <p className="text-sm font-medium text-gray-700">Prescriptions:</p>
-                            <ul className="mt-1 space-y-1">
-                              {record.prescription.map((med, idx) => (
-                                <li key={idx} className="text-sm text-gray-600">
-                                  • {med.medication} - {med.dosage} ({med.frequency})
-                                </li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                        
-                        {record.notes && (
-                          <p className="text-sm text-gray-600 mt-2">
-                            <span className="font-medium">Notes:</span> {record.notes}
-                          </p>
-                        )}
-                      </div>
-                      
-                      <button
-                        onClick={() => window.open(`/api/medical-records/${record._id}/pdf`, '_blank')}
-                        className="px-4 py-2 border border-gray-300 rounded-lg text-sm hover:bg-gray-50 ml-4"
-                      >
-                        Download
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <MedicalRecordDetailModal
+              records={medicalRecords}
+              loading={loading}
+              onViewRecord={setSelectedMedicalRecord}
+            />
           </div>
         )}
-        {/* History Tab */}
+
+        {activeTab === 'prescriptions' && (
+          // C. No socket listeners inside PrescriptionsTab anymore
+          <PrescriptionsTab
+            prescriptions={prescriptions}
+            highlightedPrescriptions={highlightedPrescriptions}
+            loading={loading}
+            onViewDetails={setSelectedPrescription}
+          />
+        )}
+
+        {activeTab === 'payments' && (
+          // A. Bills passed as props — PaymentsTab no longer self-fetches
+          <PaymentsTab
+            bills={bills}
+            loading={billsLoading}
+            onPayment={handlePaymentInitiation}
+            onRefresh={fetchBills}
+          />
+        )}
+
         {activeTab === 'history' && (
-          <div className="bg-white rounded-lg border border-gray-200">
-            <div className="p-6 border-b border-gray-200">
-              <h2 className="text-lg font-semibold">Appointment History</h2>
-              <p className="text-sm text-gray-500">View your past appointments and medical notes</p>
-            </div>
-            <div className="overflow-x-auto">
-              <table className="w-full">
-                <thead className="bg-gray-50 border-b border-gray-200">
-                  <tr>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Date</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Doctor</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Specialty</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Time</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
-                    <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Notes</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-200">
-                  {loading && appointmentHistory.length === 0 ? (
-                    <tr>
-                      <td colSpan="6" className="px-6 py-12 text-center text-gray-500">
-                        Loading appointment history...
-                      </td>
-                    </tr>
-                  ) : appointmentHistory.length === 0 ? (
-                    <tr>
-                      <td colSpan="6" className="px-6 py-12 text-center text-gray-500">
-                        No appointment history yet
-                      </td>
-                    </tr>
-                  ) : (
-                    appointmentHistory.map((appointment) => (
-                      <tr key={appointment._id} className="hover:bg-gray-50">
-                        <td className="px-6 py-4 whitespace-nowrap text-sm">
-                          {formatDate(appointment.start)}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                          Dr. {appointment.doctor?.firstName} {appointment.doctor?.lastName}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600">
-                          {appointment.doctor?.specialization}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap text-sm">
-                          {formatTime(appointment.start)}
-                        </td>
-                        <td className="px-6 py-4 whitespace-nowrap">
-                          <span className={`px-3 py-1 text-xs font-medium rounded-full ${
-                            appointment.status === 'completed'
-                              ? 'bg-blue-100 text-blue-800'
-                              : 'bg-red-100 text-red-800'
-                          }`}>
-                            {appointment.status}
-                          </span>
-                        </td>
-                        <td className="px-6 py-4 text-sm text-gray-600">
-                          {appointment.notes || '-'}
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </div>
+          <HistoryTab appointmentHistory={appointmentHistory} loading={loading} />
         )}
       </main>
 
-      {/* Modals */}
-      <NotificationsModal 
-        isOpen={showNotifications} 
-        onClose={() => handleModalClose('notifications')} 
+      <NotificationsModal
+        isOpen={showNotifications}
+        onClose={() => { setShowNotifications(false); fetchStats(); }}
       />
-      <SettingsModal 
-        isOpen={showSettings} 
-        onClose={() => handleModalClose('settings')} 
-      />
+      <SettingsModal isOpen={showSettings} onClose={() => setShowSettings(false)} />
+
       {showRescheduleModal && selectedAppointmentForReschedule && (
         <RescheduleModal
           isOpen={showRescheduleModal}
-          onClose={() => handleModalClose('reschedule')}
+          onClose={() => {
+            setShowRescheduleModal(false);
+            setSelectedAppointmentForReschedule(null);
+          }}
           appointment={selectedAppointmentForReschedule}
-          onSubmit={handleRescheduleSubmit}
+          onSubmit={handleReschedule}
         />
       )}
+
+      {selectedPrescription && (
+        <PrescriptionDetailModal
+          prescription={selectedPrescription}
+          onClose={() => setSelectedPrescription(null)}
+        />
+      )}
+
+      <PaymentVerificationModal
+        isOpen={showPaymentModal}
+        onClose={() => { setShowPaymentModal(false); setPaymentData(null); }}
+        paymentData={paymentData}
+        onSuccess={handlePaymentSuccess}
+      />
     </div>
   );
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PatientDashboard = () => (
+  <ConsultationProvider>
+    <PatientDashboardContent />
+  </ConsultationProvider>
+);
 
 export default PatientDashboard;

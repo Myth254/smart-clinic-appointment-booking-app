@@ -53,6 +53,13 @@ const sendEmail = async (options) => {
     return info
   } catch (error) {
     console.error('❌ Email send error:', error.message)
+    console.error('Mail config:', {
+      host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+      port: parseInt(process.env.EMAIL_PORT) || 587,
+      secure: process.env.EMAIL_PORT === '465',
+      userConfigured: Boolean(process.env.EMAIL_USER),
+      passConfigured: Boolean(process.env.EMAIL_PASS)
+    })
 
     // Don't throw error in development to prevent registration failures
     if (process.env.NODE_ENV === 'development') {

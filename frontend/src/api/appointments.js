@@ -4,13 +4,6 @@ import axiosClient from './axiosClient'
 export const appointmentsAPI = {
   // Create appointment - matches validation.js schema
   createAppointment: async (appointmentData) => {
-    // Ensure data matches validation.js requirements:
-    // - doctorId (not 'doctor')
-    // - start (ISO8601 string)
-    // - end (ISO8601 string)
-    // - reason (10-500 chars)
-    // - type (optional: consultation, follow-up, checkup, emergency, routine)
-    
     const payload = {
       doctorId: appointmentData.doctorId,
       start: appointmentData.start,
@@ -19,6 +12,12 @@ export const appointmentsAPI = {
       type: appointmentData.type || 'consultation',
       notes: appointmentData.notes || ''
     };
+
+    // ✅ FIX: Only include followUpOf if it's a valid non-empty string
+    // Omitting the field entirely is better than sending null/undefined
+    if (appointmentData.followUpOf && typeof appointmentData.followUpOf === 'string') {
+      payload.followUpOf = appointmentData.followUpOf;
+    }
 
     console.log('📤 Creating appointment with payload:', payload);
 
@@ -46,6 +45,17 @@ export const appointmentsAPI = {
     return response.data;
   },
 
+  // ✅ NEW: Start appointment session (Doctor only)
+  /**
+   * Start a session for an appointment
+   * @param {string} appointmentId - Appointment ID
+   * @returns {Promise} - { success, message, data: { session, appointment } }
+   */
+  startAppointmentSession: async (appointmentId) => {
+    const response = await axiosClient.post(`/appointments/${appointmentId}/start-session`);
+    return response.data;
+  },
+
   // Update appointment status (Doctor/Admin)
   updateAppointmentStatus: async (appointmentId, statusData) => {
     const response = await axiosClient.put(
@@ -55,9 +65,15 @@ export const appointmentsAPI = {
     return response.data;
   },
 
+  dismissFollowUpReminder: async (appointmentId) => {
+    const response = await axiosClient.put(
+      `/appointments/${appointmentId}/follow-up-reminder/dismiss`
+    );
+    return response.data;
+  },
+
   // Reschedule appointment
   rescheduleAppointment: async (appointmentId, rescheduleData) => {
-    // Ensure dates are in ISO8601 format
     const payload = {
       newStart: rescheduleData.newStart,
       newEnd: rescheduleData.newEnd,

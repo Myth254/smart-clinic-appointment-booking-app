@@ -2,6 +2,26 @@ import React from 'react';
 import { Calendar as CalendarIcon, Clock, User, ChevronLeft, ChevronRight, Plus } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 
+// ── FIX E: centralised status display maps ────────────────────────────────────
+const STATUS_LABEL = {
+  pending:     'Pending',
+  approved:    'Confirmed',
+  in_progress: 'In Progress',
+  completed:   'Completed',
+  cancelled:   'Cancelled',
+  'no-show':   'No Show',
+};
+
+const STATUS_COLOR = {
+  pending:     'bg-yellow-100 text-yellow-800',
+  approved:    'bg-green-100 text-green-800',
+  in_progress: 'bg-purple-100 text-purple-800',
+  completed:   'bg-blue-100 text-blue-800',
+  cancelled:   'bg-red-100 text-red-800',
+  'no-show':   'bg-orange-100 text-orange-800',
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 const OverviewTab = ({
   stats,
   todayAppointments,
@@ -36,8 +56,8 @@ const OverviewTab = ({
             <p className="text-3xl font-bold">{stats.todayCount}</p>
             <p className="text-sm text-gray-500">
               Next at{' '}
-              {todayAppointments[0]
-                ? format(parseISO(todayAppointments[0].start), 'h:mm a')
+              {stats.nextAppointmentTime
+                ? format(parseISO(stats.nextAppointmentTime), 'h:mm a')
                 : 'N/A'}
             </p>
           </div>
@@ -64,8 +84,7 @@ const OverviewTab = ({
           <div className="space-y-1">
             <p className="text-3xl font-bold">{stats.confirmedCount}</p>
             <p className="text-sm text-gray-500">
-              {todayAppointments.filter((apt) => apt.status === 'pending').length}{' '}
-              pending
+              {stats.pendingCount ?? 0} pending confirmation
             </p>
           </div>
         </div>
@@ -294,18 +313,13 @@ const OverviewTab = ({
                         </>
                       ) : (
                         <>
+                          {/* FIX E: use STATUS_LABEL/STATUS_COLOR for all statuses */}
                           <span
                             className={`px-3 py-1 text-xs font-medium rounded-full ${
-                              appointment.status === 'approved'
-                                ? 'bg-green-100 text-green-800'
-                                : appointment.status === 'completed'
-                                  ? 'bg-blue-100 text-blue-800'
-                                  : 'bg-gray-100 text-gray-800'
+                              STATUS_COLOR[appointment.status] || 'bg-gray-100 text-gray-800'
                             }`}
                           >
-                            {appointment.status === 'approved'
-                              ? 'Confirmed'
-                              : appointment.status}
+                            {STATUS_LABEL[appointment.status] || appointment.status}
                           </span>
                           <button
                             onClick={() => onViewAppointmentDetails(appointment)}

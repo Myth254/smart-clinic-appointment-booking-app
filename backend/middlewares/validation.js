@@ -146,6 +146,10 @@ export const validateAppointmentBooking = [
     .optional()
     .isIn(['consultation', 'follow-up', 'checkup', 'emergency', 'routine']).withMessage('Invalid appointment type'),
 
+  body('followUpOf')
+    .optional({ nullable: true })
+    .isMongoId().withMessage('Invalid follow-up appointment reference'),
+
   handleValidationErrors
 ]
 
@@ -230,11 +234,50 @@ export const validateAdminUserCreation = [
 
   body('role')
     .notEmpty().withMessage('Role is required')
-    .isIn(['patient', 'doctor', 'admin']).withMessage('Invalid role specified'),
+    .isIn(['patient', 'doctor', 'admin', 'lab_personnel', 'pharmacy_staff'])
+    .withMessage('Invalid role specified'),
 
+  // Doctor
   body('specialization')
     .if(body('role').equals('doctor'))
     .notEmpty().withMessage('Specialization is required for doctors'),
+
+  // Patient
+  body('dateOfBirth')
+    .if(body('role').equals('patient'))
+    .notEmpty().withMessage('Date of birth is required for patients')
+    .isISO8601().withMessage('Please provide a valid date'),
+
+  // Lab personnel
+  body('labSpecialization')
+    .if(body('role').equals('lab_personnel'))
+    .notEmpty().withMessage('Lab specialization is required')
+    .isIn([
+      'Clinical Pathology', 'Hematology', 'Microbiology', 'Biochemistry',
+      'Immunology', 'Molecular Biology', 'Cytology', 'Histopathology',
+      'General Laboratory', 'Other'
+    ]).withMessage('Invalid lab specialization'),
+
+  body('clinic')
+    .if(body('role').isIn(['lab_personnel', 'pharmacy_staff']))
+    .notEmpty().withMessage('Clinic is required for lab personnel and pharmacy staff')
+    .isMongoId().withMessage('Clinic must be a valid ID'),
+
+  // Pharmacy staff
+  body('licenseNumber')
+    .if(body('role').equals('pharmacy_staff'))
+    .notEmpty().withMessage('License number is required'),
+
+  body('licenseExpiry')
+    .if(body('role').equals('pharmacy_staff'))
+    .notEmpty().withMessage('License expiry is required')
+    .isISO8601().withMessage('Please provide a valid date'),
+
+  body('pharmacyRole')
+    .if(body('role').equals('pharmacy_staff'))
+    .notEmpty().withMessage('Pharmacy role is required')
+    .isIn(['Pharmacist', 'Pharmacy Technician', 'Pharmacy Assistant'])
+    .withMessage('Invalid pharmacy role'),
 
   handleValidationErrors
 ]

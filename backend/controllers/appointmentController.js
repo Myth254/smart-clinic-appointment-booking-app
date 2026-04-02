@@ -1,6 +1,6 @@
-<<<<<<< Updated upstream
 /* eslint-disable no-unused-vars */
 // controllers/appointmentController.js
+import mongoose from 'mongoose'
 import Appointment from '../models/Appointment.js'
 import User from '../models/User.js'
 import Doctor from '../models/Doctor.js'
@@ -11,13 +11,101 @@ import { sendAppointmentConfirmation, sendAppointmentCancellation } from '../uti
 import { parseTimeOnDate, generateTimeSlots } from '../utils/availability.js'
 import AvailabilityRule from '../models/AvailabilityRule.js'
 import AvailabilityException from '../models/AvailabilityException.js'
+import Session from '../models/Session.js'
+import logAudit from '../utils/auditLogger.js'
+
+const FOLLOW_UP_REMINDER_KIND = 'follow_up_required'
+
+const buildFollowUpReminderMessage = (appointment) => {
+  if (!appointment.followUpDate) {
+    return 'Your doctor recommended a follow-up appointment. Please book it when you can.'
+  }
+
+  return `Your doctor recommended a follow-up appointment by ${new Date(appointment.followUpDate).toLocaleDateString()}.`
+}
+
+const upsertFollowUpReminder = async (appointment) => {
+  if (!appointment?.patient || !appointment?.isFollowUpRequired) {
+    return null
+  }
+
+  return await Notification.findOneAndUpdate(
+    {
+      user: appointment.patient,
+      type: 'reminder',
+      relatedId: appointment._id,
+      relatedModel: 'Appointment',
+      status: 'active',
+      'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+    },
+    {
+      $set: {
+        status: 'active',
+        title: 'Follow-Up Appointment Required',
+        message: buildFollowUpReminderMessage(appointment),
+        priority: 'high',
+        read: false,
+        readAt: null,
+        metadata: {
+          reminderKind: FOLLOW_UP_REMINDER_KIND,
+          appointmentId: appointment._id,
+          followUpDate: appointment.followUpDate,
+          followUpReason: appointment.followUpReason || '',
+          followUpNotes: appointment.followUpNotes || ''
+        }
+      },
+      $setOnInsert: {
+        user: appointment.patient,
+        type: 'reminder',
+        relatedId: appointment._id,
+        relatedModel: 'Appointment'
+      }
+    },
+    {
+      upsert: true,
+      new: true,
+      setDefaultsOnInsert: true
+    }
+  )
+}
+
+const resolveFollowUpReminders = async ({ appointmentId, userId }) => {
+  const filter = {
+    type: 'reminder',
+    relatedId: appointmentId,
+    relatedModel: 'Appointment',
+    'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+  }
+
+  if (userId) {
+    filter.user = userId
+  }
+
+  return await Notification.resolveActive(filter)
+}
 
 // @desc    Create appointment (Patient)
 // @route   POST /api/appointments
 // @access  Private (Patient)
 export const createAppointment = async (req, res) => {
   try {
-    const { doctorId, start, end, reason, type, notes } = req.body
+    const {
+      doctorId,
+      start,
+      end,
+      reason,
+      type,
+      notes,
+      followUpOf,
+      status: clientStatus
+    } = req.body
+
+    // ✅ FIX BUG #3: Explicitly reject if client tries to set status
+    if (clientStatus !== undefined) {
+      return res.status(400).json({
+        message: 'Cannot manually set appointment status. Appointment status is managed by the backend.'
+      })
+    }
 
     // Validate required fields
     if (!doctorId || !start || !end || !reason) {
@@ -41,6 +129,12 @@ export const createAppointment = async (req, res) => {
       })
     }
 
+    if (followUpOf !== undefined && !mongoose.Types.ObjectId.isValid(followUpOf)) {
+      return res.status(400).json({
+        message: 'Invalid followUpOf reference'
+      })
+    }
+
     // ✅ DEBUG LOGGING
     console.log('🔍 CREATE APPOINTMENT DEBUG:')
     console.log('User:', req.user)
@@ -61,6 +155,19 @@ export const createAppointment = async (req, res) => {
       return res.status(400).json({
         message: 'Doctor is currently not accepting appointments'
       })
+    }
+
+    let originalFollowUpAppointment = null
+    if (followUpOf) {
+      originalFollowUpAppointment = await Appointment.findById(followUpOf)
+
+      if (!originalFollowUpAppointment) {
+        return res.status(404).json({ message: 'Original follow-up appointment not found' })
+      }
+
+      if (originalFollowUpAppointment.patient.toString() !== req.user.id.toString()) {
+        return res.status(403).json({ message: 'Not authorized to book a follow-up for this appointment' })
+      }
     }
 
     // ✅ IMPROVED: Check patient profile, create if doesn't exist
@@ -113,6 +220,17 @@ export const createAppointment = async (req, res) => {
       return res.status(400).json({ message: 'Cannot book appointments in the past' })
     }
 
+    // ✅ Add maximum booking window (3 months in advance)
+    const maxBookingDate = new Date()
+    maxBookingDate.setMonth(maxBookingDate.getMonth() + 3)
+
+    if (startDate > maxBookingDate) {
+      return res.status(400).json({
+        message: 'Cannot book appointments more than 3 months in advance',
+        maxBookingDate: maxBookingDate.toISOString()
+      })
+    }
+
     // Get date components in UTC
     const dateISO = startDate.toISOString().slice(0, 10)
     const weekday = startDate.getUTCDay()
@@ -120,7 +238,7 @@ export const createAppointment = async (req, res) => {
 
     console.log('📅 Booking request:', { dateISO, weekday, timeStr, start, end })
 
-    // Check for exceptions (blocks)
+    // ── Availability checks (no lock needed — these are read-only guards) ──
     const exception = await AvailabilityException.findOne({
       doctor: doctorId,
       date: dateISO,
@@ -133,7 +251,6 @@ export const createAppointment = async (req, res) => {
       })
     }
 
-    // Check for recurring availability rules
     const availabilityRule = await AvailabilityRule.findOne({
       doctor: doctorId,
       weekday: weekday
@@ -145,7 +262,6 @@ export const createAppointment = async (req, res) => {
       })
     }
 
-    // Generate allowed slots
     const allowedSlots = generateTimeSlots(
       dateISO,
       availabilityRule.startTime,
@@ -155,7 +271,6 @@ export const createAppointment = async (req, res) => {
 
     console.log('🎰 Generated slots:', allowedSlots.length)
 
-    // Find matching slot
     const TOLERANCE_MS = 1000
     const matchingSlot = allowedSlots.find(slot => {
       const startDiff = Math.abs(slot.start.getTime() - startDate.getTime())
@@ -171,83 +286,176 @@ export const createAppointment = async (req, res) => {
       })
     }
 
-    // Check for conflicts
-    const conflict = await Appointment.findOne({
-      doctor: doctorId,
-      status: { $nin: ['cancelled', 'no-show'] },
-      $or: [
-        {
-          start: { $lt: endDate },
-          end: { $gt: startDate }
-        }
-      ]
-    })
-
-    if (conflict) {
-      return res.status(400).json({
-        message: 'This time slot is already booked. Please choose another time.'
-      })
-    }
-
-    // Calculate duration
+    // Calculate duration before the atomic write
     const duration = Math.round((endDate - startDate) / (1000 * 60))
 
-    // Create appointment
-    const appointment = await Appointment.create({
-      patient: req.user.id,
-      doctor: doctorId,
-      start: startDate,
-      end: endDate,
-      duration,
-      reason,
-      type: type || 'consultation',
-      notes: notes || '',
-      status: 'pending'
-    })
+    // ── Atomic guard: collapse conflict-check + insert into one DB operation ──
+    //
+    // findOneAndUpdate with upsert:true is a single atomic op — MongoDB
+    // evaluates the filter AND performs the insert in one indivisible step,
+    // so no concurrent request can slip through.
+    //
+    // We use new:true (return the post-op doc) and NO rawResult, because
+    // rawResult's shape is inconsistent across Mongoose versions (null vs
+    // object on insert) and caused Cannot read properties of null errors.
+    //
+    // Conflict detection logic:
+    //   • If a doc already existed for this slot, $setOnInsert is a no-op and
+    //     the returned doc's patient will NOT be the current user → 409.
+    //   • If we did the insert, the returned doc's patient IS the current user → 201.
+    //   • E11000 from the unique index is the final safety net → 409.
 
-    // Populate for response
-    await appointment.populate([
-      { path: 'patient', select: 'firstName lastName email phoneNumber' },
-      { path: 'doctor', select: 'firstName lastName email phoneNumber' }
-    ])
+    let appointment
+    const initialStatus = followUpOf ? 'pending_confirmation' : 'pending'
+    const appointmentType = followUpOf ? 'follow-up' : (type || 'consultation')
+    try {
+      const resultDoc = await Appointment.findOneAndUpdate(
+        {
+          doctor: doctorId,
+          start: startDate,
+          end: endDate,
+          status: { $in: ['pending', 'pending_confirmation', 'approved', 'in_progress', 'completed'] }
+        },
+        {
+          $setOnInsert: {
+            patient: req.user.id,
+            doctor: doctorId,
+            start: startDate,
+            end: endDate,
+            duration,
+            reason,
+            type: appointmentType,
+            notes: notes || '',
+            status: initialStatus,
+            followUpOf: followUpOf || null,
+            isFollowUpRequired: false
+          }
+        },
+        {
+          upsert: true,
+          new: true,          // always returns the doc — never null
+          runValidators: true
+        }
+      )
 
-    // Get full user details
-    const patientUser = await User.findById(req.user.id)
+      // If the slot was already taken, $setOnInsert was a no-op and the
+      // returned doc belongs to a different patient.
+      if (resultDoc.patient.toString() !== req.user.id.toString()) {
+        return res.status(409).json({
+          message: 'This time slot was just booked by another patient. Please choose a different time.',
+          conflict: true
+        })
+      }
 
-    // Create notifications
-    await Notification.create({
-      user: req.user.id,
-      type: 'appointment',
-      title: 'Appointment Booked',
-      message: `Your appointment with Dr. ${doctorUser.firstName} ${doctorUser.lastName} has been booked for ${startDate.toLocaleString()}.`,
-      data: { appointmentId: appointment._id },
-      read: false
-    })
+      appointment = resultDoc
 
-    await Notification.create({
-      user: doctorId,
-      type: 'appointment',
-      title: 'New Appointment Request',
-      message: `${patientUser.firstName} ${patientUser.lastName} has requested an appointment for ${startDate.toLocaleString()}.`,
-      data: { appointmentId: appointment._id },
-      read: false
-    })
+    } catch (err) {
+      // ── Second-layer safety net ──────────────────────────────────────────
+      // The unique index 'unique_active_time_slot' catches any race that slips
+      // past the upsert (e.g. direct DB writes, future code paths, replica
+      // edge cases). Translate E11000 into a clean 409 — never a raw 500.
+      if (err.code === 11000) {
+        return res.status(409).json({
+          message: 'This time slot was just booked by another patient. Please choose a different time.',
+          conflict: true
+        })
+      }
+      throw err
+    }
 
-    // Send confirmation email
-    sendAppointmentConfirmation({
-      patientEmail: patientUser.email,
-      patientName: `${patientUser.firstName} ${patientUser.lastName}`,
-      doctorName: `Dr. ${doctorUser.firstName} ${doctorUser.lastName}`,
-      date: startDate.toLocaleDateString(),
-      time: startDate.toLocaleTimeString()
-    }).catch(err => console.error('Email send error:', err))
+    try {
+      if (originalFollowUpAppointment) {
+        await Appointment.findOneAndUpdate(
+          { _id: originalFollowUpAppointment._id, patient: req.user.id },
+          { $set: { isFollowUpRequired: false } }
+        )
 
-    console.log('✅ Appointment created successfully:', appointment._id)
+        await resolveFollowUpReminders({
+          appointmentId: originalFollowUpAppointment._id,
+          userId: req.user.id
+        })
+      }
 
-    return res.status(201).json({
-      message: 'Appointment created successfully',
-      appointment
-    })
+      // ── Audit log ──────────────────────────────────────────────────────────
+      await logAudit({
+        userId: req.user.id,
+        action: 'appointment_created',
+        resourceType: 'Appointment',
+        resourceId: appointment._id,
+        details: {
+          doctorId,
+          start: startDate,
+          end: endDate,
+          reason,
+          type: appointmentType,
+          followUpOf: followUpOf || null
+        },
+        req
+      }).catch(err => console.error('Audit log error:', err))
+
+      // Populate for response
+      await appointment.populate([
+        { path: 'patient', select: 'firstName lastName email phoneNumber' },
+        { path: 'doctor', select: 'firstName lastName email phoneNumber' }
+      ])
+
+      // Get full user details
+      const patientUser = await User.findById(req.user.id)
+
+      // Create notifications (with error handling)
+      await Notification.create({
+        user: req.user.id,
+        type: 'appointment',
+        title: followUpOf ? 'Follow-Up Appointment Booked' : 'Appointment Booked',
+        message: `Your appointment with Dr. ${doctorUser.firstName} ${doctorUser.lastName} has been booked for ${startDate.toLocaleString()}.`,
+        data: { appointmentId: appointment._id },
+        read: false
+      }).catch(err => {
+        console.error('❌ Failed to create patient notification:', err)
+      // Don't fail the appointment creation
+      })
+
+      await Notification.create({
+        user: doctorId,
+        type: 'appointment',
+        title: followUpOf ? 'New Follow-Up Appointment Request' : 'New Appointment Request',
+        message: `${patientUser.firstName} ${patientUser.lastName} has requested an appointment for ${startDate.toLocaleString()}.`,
+        data: { appointmentId: appointment._id, followUpOf: followUpOf || null },
+        read: false
+      }).catch(err => {
+        console.error('❌ Failed to create doctor notification:', err)
+      // Don't fail the appointment creation
+      })
+
+      // Send confirmation email (with better error handling)
+      sendAppointmentConfirmation({
+        patientEmail: patientUser.email,
+        patientName: `${patientUser.firstName} ${patientUser.lastName}`,
+        doctorName: `Dr. ${doctorUser.firstName} ${doctorUser.lastName}`,
+        date: startDate.toLocaleDateString(),
+        time: startDate.toLocaleTimeString()
+      })
+        .then(() => console.log('✅ Confirmation email sent to:', patientUser.email))
+        .catch(err => {
+          console.error('❌ Failed to send confirmation email:', err.message)
+        // Email failure should not block appointment creation
+        })
+
+      console.log('✅ Appointment created successfully:', appointment._id)
+
+      return res.status(201).json({
+        message: 'Appointment created successfully',
+        appointment
+      })
+    } catch (postWriteError) {
+      // Post-write steps (notifications, email, audit) must not roll back the
+      // booking — the slot is already reserved. Log and continue.
+      console.error('❌ Post-booking step failed:', postWriteError)
+      return res.status(201).json({
+        message: 'Appointment created successfully',
+        appointment
+      })
+    }
   } catch (error) {
     console.error('❌ Create appointment error:', error)
     return res.status(500).json({ message: error.message })
@@ -259,7 +467,8 @@ export const createAppointment = async (req, res) => {
 // @access  Private
 export const getAppointments = async (req, res) => {
   try {
-    const { status, startDate, endDate, doctorId, patientId, limit = 10, offset = 0 } = req.query
+    // ✅ FIXED: Increased default limit from 10 to 1000 for dashboard
+    const { status, startDate, endDate, doctorId, patientId, limit = 1000, offset = 0 } = req.query
 
     // Build query based on user role
     let query = {}
@@ -291,6 +500,18 @@ export const getAppointments = async (req, res) => {
       if (endDate) query.start.$lte = new Date(endDate)
     }
 
+    // ✅ ADDED: Comprehensive logging for debugging
+    console.log('═════════════════════════════════════════════')
+    console.log('🔍 GET APPOINTMENTS REQUEST')
+    console.log('═════════════════════════════════════════════')
+    console.log('👤 User:', {
+      id: req.user.id,
+      role: req.user.role,
+      email: req.user.email
+    })
+    console.log('📊 Query:', JSON.stringify(query, null, 2))
+    console.log('🔧 Pagination:', { limit: parseInt(limit), offset: parseInt(offset) })
+
     // Get appointments with pagination
     const appointments = await Appointment.find(query)
       .populate({
@@ -305,12 +526,56 @@ export const getAppointments = async (req, res) => {
         path: 'doctorProfile', // ✅ Populate the virtual field
         select: 'specialization status'
       })
-      .sort({ start: -1 })
+      .populate({
+        path: 'followUpOf',
+        select: 'start end status followUpDate type'
+      })
+      .sort({ start: 1 })  // ✅ FIXED: Ascending order (upcoming appointments first)
       .limit(parseInt(limit))
       .skip(parseInt(offset))
 
+    console.log('✅ Query executed successfully')
+    console.log('📋 Found appointments:', appointments.length)
+
+    // Status breakdown
+    const statusBreakdown = appointments.reduce((acc, apt) => {
+      acc[apt.status] = (acc[apt.status] || 0) + 1
+      return acc
+    }, {})
+    console.log('📊 Status breakdown:', statusBreakdown)
+
+    // Today's appointments
+    const today = new Date()
+    today.setHours(0, 0, 0, 0)
+    const tomorrow = new Date(today)
+    tomorrow.setDate(tomorrow.getDate() + 1)
+    const todayCount = appointments.filter(apt => {
+      const aptDate = new Date(apt.start)
+      return aptDate >= today && aptDate < tomorrow
+    }).length
+    console.log('📅 Today\'s appointments in result:', todayCount)
+    console.log('═════════════════════════════════════════════\n')
+
     // Get total count
     const total = await Appointment.countDocuments(query)
+
+    let activeFollowUpRemindersByAppointmentId = new Map()
+    if (req.user.role === 'patient' && appointments.length > 0) {
+      const reminderDocs = await Notification.find({
+        user: req.user.id,
+        type: 'reminder',
+        relatedModel: 'Appointment',
+        relatedId: { $in: appointments.map(apt => apt._id) },
+        status: 'active',
+        'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+      })
+        .select('_id relatedId title message createdAt priority read status metadata')
+        .lean()
+
+      activeFollowUpRemindersByAppointmentId = new Map(
+        reminderDocs.map(notification => [String(notification.relatedId), notification])
+      )
+    }
 
     // ✅ Transform appointments to include specialization at doctor level
     const transformedAppointments = appointments.map(apt => {
@@ -324,8 +589,25 @@ export const getAppointments = async (req, res) => {
       // Remove the virtual field from response to keep it clean
       delete aptObj.doctorProfile
 
+      const activeReminder = activeFollowUpRemindersByAppointmentId.get(String(aptObj._id))
+      if (activeReminder) {
+        aptObj.activeFollowUpReminder = activeReminder
+      }
+
       return aptObj
     })
+
+    // ✅ LOG AUDIT: Appointments Retrieved
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointments_retrieved',
+      resourceType: 'Appointment',
+      details: {
+        filters: { status, startDate, endDate, doctorId, patientId },
+        recordsReturned: appointments.length
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
 
     return res.json({
       appointments: transformedAppointments,
@@ -357,6 +639,10 @@ export const getAppointmentById = async (req, res) => {
       .populate({
         path: 'doctor',
         select: 'firstName lastName specialization phoneNumber email'
+      })
+      .populate({
+        path: 'followUpOf',
+        select: 'start end status followUpDate type'
       })
 
     if (!appointment) {
@@ -392,12 +678,74 @@ export const getAppointmentById = async (req, res) => {
       appointment: id
     }).select('diagnosis prescription notes')
 
+    if (req.user.role === 'patient') {
+      const activeReminder = await Notification.findOne({
+        user: req.user.id,
+        type: 'reminder',
+        relatedId: appointment._id,
+        relatedModel: 'Appointment',
+        status: 'active',
+        'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+      })
+        .select('_id title message createdAt priority read status metadata')
+        .lean()
+
+      if (activeReminder) {
+        appointmentData.activeFollowUpReminder = activeReminder
+      }
+    }
+
+    // ✅ LOG AUDIT: Appointment Retrieved
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointment_viewed',
+      resourceType: 'Appointment',
+      resourceId: id,
+      details: {
+        doctorId: appointment.doctor._id,
+        patientId: appointment.patient._id,
+        status: appointment.status
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
+
     return res.json({
       appointment: appointmentData,
       medicalRecord: medicalRecord || null
     })
   } catch (error) {
     console.error('Get appointment error:', error)
+    return res.status(500).json({ message: error.message })
+  }
+}
+
+// @desc    Dismiss active follow-up reminder for an appointment
+// @route   PUT /api/appointments/:id/follow-up-reminder/dismiss
+// @access  Private (Patient)
+export const dismissFollowUpReminder = async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const appointment = await Appointment.findById(id)
+
+    if (!appointment) {
+      return res.status(404).json({ message: 'Appointment not found' })
+    }
+
+    if (appointment.patient.toString() !== req.user.id.toString()) {
+      return res.status(403).json({ message: 'Not authorized to dismiss this reminder' })
+    }
+
+    await resolveFollowUpReminders({
+      appointmentId: appointment._id,
+      userId: req.user.id
+    })
+
+    return res.json({
+      message: 'Follow-up reminder dismissed successfully'
+    })
+  } catch (error) {
+    console.error('Dismiss follow-up reminder error:', error)
     return res.status(500).json({ message: error.message })
   }
 }
@@ -414,140 +762,71 @@ export const updateAppointmentStatus = async (req, res) => {
       return res.status(400).json({ message: 'Status is required' })
     }
 
-    const validStatuses = ['pending', 'approved', 'completed', 'cancelled', 'no-show']
-=======
-import Appointment from '../models/Appointment.js'
-import User from '../models/User.js'
-import AvailabilityRule from '../models/AvailabilityRule.js'
-import AvailabilityException from '../models/AvailabilityException.js'
-import { generateTimeSlots, parseTimeOnDate } from '../utils/availability.js'
-import sendEmail from '../utils/sendEmail.js'
-import { format } from 'date-fns'
-
-// @desc    Get all appointments for logged-in doctor
-// @route   GET /api/v1/appointments/doctor
-// @access  Doctor
-export const getDoctorAppointments = async (req, res) => {
-  try {
-    // Ensure only doctors can access this route
-    if (req.user.role !== 'doctor') {
-      return res.status(403).json({ message: 'Access denied: Doctors only' })
-    }
-
-    const appointments = await Appointment.find({ doctor: req.user._id })
-      .populate('patient', 'firstName lastName email phoneNumber')
-      .sort({ appointmentDate: 1 })
-
-    res.json(appointments)
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-// @desc    Get all appointments for logged-in patient
-// @route   GET /api/v1/appointments/patient
-// @access  Patient
-export const getPatientAppointments = async (req, res) => {
-  try {
-    // Ensure only patients can access this route
-    if (req.user.role !== 'patient') {
-      return res.status(403).json({ message: 'Access denied: Patients only' })
-    }
-
-    const appointments = await Appointment.find({ patient: req.user._id })
-      .populate('doctor', 'firstName lastName email specialization')
-      .sort({ appointmentDate: 1 })
-
-    res.json(appointments)
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-/**
- * @desc    Get all appointments (Admin only)
- * @route   GET /api/v1/appointments
- * @access  Admin
- */
-export const getAppointments = async (req, res) => {
-  try {
-    const appointments = await Appointment.find()
-      .populate('patient', 'firstName lastName email phoneNumber')
-      .populate('doctor', 'firstName lastName email specialization')
-
-    res.json(appointments)
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-/**
- * @desc    Update appointment status (Admin or Doctor)
- * @route   PUT /api/v1/appointments/:id/status
- * @access  Admin/Doctor
- */
-export const updateAppointmentStatus = async (req, res) => {
-  try {
-    const { id } = req.params
-    const { status } = req.body
-
-    const validStatuses = ['pending', 'confirmed', 'cancelled', 'completed', 'rescheduled']
->>>>>>> Stashed changes
+    const validStatuses = ['pending', 'pending_confirmation', 'approved', 'in_progress', 'completed', 'cancelled', 'no-show']
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ message: 'Invalid status value' })
     }
 
     const appointment = await Appointment.findById(id)
-<<<<<<< Updated upstream
       .populate('patient', 'firstName lastName email')
       .populate('doctor', 'firstName lastName email')
-=======
-    if (!appointment) {
-      return res.status(404).json({ message: 'Appointment not found' })
-    }
-
-    // Only admin or the assigned doctor can update status
-    if (
-      req.user.role !== 'admin' &&
-      req.user._id.toString() !== appointment.doctor.toString()
-    ) {
-      return res.status(403).json({ message: 'Access denied' })
-    }
-
-    appointment.status = status
-    await appointment.save()
-
-    res.json({
-      message: 'Appointment status updated successfully',
-      appointment,
-    })
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-/**
- * @desc    Delete appointment (Admin only)
- * @route   DELETE /api/v1/appointments/:id
- * @access  Admin
- */
-export const deleteAppointment = async (req, res) => {
-  try {
-    const { id } = req.params
-    const appointment = await Appointment.findById(id)
->>>>>>> Stashed changes
 
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' })
     }
 
-<<<<<<< Updated upstream
-    // Authorization: doctor can only update their own appointments
-    if (req.user.role === 'doctor' && appointment.doctor._id.toString() !== req.user.id) {
+    // ✅ FIX BUG #4: Comprehensive authorization check
+    const isDoctor = req.user.role === 'doctor'
+    const isAdmin = req.user.role === 'admin'
+    const isAssignedDoctor = appointment.doctor._id.toString() === req.user.id
+
+    // Only doctors and admins can update appointment status
+    if (!isDoctor && !isAdmin) {
+      return res.status(403).json({
+        message: 'Only doctors and administrators can update appointment status'
+      })
+    }
+
+    // Doctors can only update their own appointments
+    if (isDoctor && !isAssignedDoctor) {
       return res.status(403).json({
         message: 'Not authorized to update this appointment'
       })
     }
+
+    // Doctors should not be able to set status to 'cancelled'
+    // (cancellation should be done through separate endpoint by patient/admin)
+    if (isDoctor && status === 'cancelled') {
+      return res.status(400).json({
+        message: 'Doctors cannot cancel appointments. Patients must cancel through their dashboard.'
+      })
+    }
+
+    // ✅ FIX BUG #2: Validate state transitions
+    const validTransitions = {
+      pending: ['approved', 'cancelled'],
+      pending_confirmation: ['approved', 'cancelled'],
+      approved: ['in_progress', 'completed', 'cancelled', 'no-show'],
+      in_progress: ['completed', 'cancelled', 'no-show'],
+      completed: [],
+      cancelled: [],
+      'no-show': []
+    }
+
+    const currentStatus = appointment.status
+    const allowedNextStates = validTransitions[currentStatus] || []
+
+    if (!allowedNextStates.includes(status)) {
+      return res.status(400).json({
+        message: `Cannot transition from '${currentStatus}' to '${status}'. Valid transitions: ${allowedNextStates.length > 0 ? allowedNextStates.join(', ') : 'none (final state)'}`,
+        currentStatus,
+        requestedStatus: status,
+        allowedTransitions: allowedNextStates
+      })
+    }
+
+    // ✅ FIX BUG #1: Capture previous status BEFORE updating
+    const previousStatus = appointment.status
 
     // Update appointment
     appointment.status = status
@@ -555,6 +834,29 @@ export const deleteAppointment = async (req, res) => {
       appointment.notes = notes
     }
     await appointment.save()
+
+    if (['cancelled', 'completed', 'no-show'].includes(status) || appointment.isFollowUpRequired === false) {
+      await resolveFollowUpReminders({
+        appointmentId: appointment._id,
+        userId: appointment.patient._id
+      })
+    }
+
+    // ✅ LOG AUDIT: Now with correct previous status
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointment_status_updated',
+      resourceType: 'Appointment',
+      resourceId: id,
+      details: {
+        previousStatus: previousStatus,  // ✅ Correct - captured before update
+        newStatus: status,
+        notes: notes || null,
+        patientId: appointment.patient._id,
+        doctorId: appointment.doctor._id
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
 
     // Get user details
     const patientUser = await User.findById(appointment.patient._id)
@@ -613,112 +915,15 @@ export const deleteAppointment = async (req, res) => {
 // @desc    Reschedule appointment
 // @route   PUT /api/appointments/:id/reschedule
 // @access  Private (Patient, Doctor, Admin)
-=======
-    // Only admin can delete
-    if (req.user.role !== 'admin') {
-      return res.status(403).json({ message: 'Access denied: Admins only' })
-    }
-
-    await appointment.deleteOne()
-    res.json({ message: 'Appointment deleted successfully' })
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-export const createAppointment = async (req, res) => {
-  try {
-    const { doctor: doctorId, start /* ISO string */, end /* ISO string */, reason } = req.body
-
-    if (!doctorId || !start || !end) return res.status(400).json({ message: 'doctor, start and end are required' })
-
-    const doctor = await User.findById(doctorId)
-    if (!doctor || doctor.role !== 'doctor') return res.status(400).json({ message: 'Invalid doctor' })
-
-    const startDate = new Date(start)
-    const endDate = new Date(end)
-
-    if (startDate >= endDate) return res.status(400).json({ message: 'Invalid start/end times' })
-
-    // 1) Check that slot is within doctor's availability:
-    const dateISO = startDate.toISOString().slice(0,10) // YYYY-MM-DD
-    // check exception first
-    const exception = await AvailabilityException.findOne({ doctor: doctorId, date: dateISO })
-    let allowedSlots = []
-    if (exception) {
-      if (!exception.isAvailable) return res.status(400).json({ message: 'Doctor not available on this date' })
-      if (exception.slots && exception.slots.length) {
-        allowedSlots = exception.slots.map(s => ({
-          start: parseTimeOnDate(dateISO, s.startTime),
-          end: parseTimeOnDate(dateISO, s.endTime)
-        }))
-      }
-    }
-
-    // if no exception override, build from rules
-    if (allowedSlots.length === 0) {
-      const weekday = startDate.getDay()
-      const rules = await AvailabilityRule.find({ doctor: doctorId, weekday })
-      for (const rule of rules) {
-        const slots = generateTimeSlots(dateISO, rule.startTime, rule.endTime, rule.slotDurationMinutes)
-        // push each with start/end Date
-        allowedSlots = allowedSlots.concat(slots.map(s => ({ start: s.start, end: s.end })))
-      }
-    }
-
-    // check if requested start/end falls exactly into one of allowedSlots (or is fully contained)
-    const isWithinAny = allowedSlots.some(slot => slot.start <= startDate && endDate <= slot.end)
-    if (!isWithinAny) return res.status(400).json({ message: 'Requested slot is not within doctor availability' })
-
-    // 2) Check overlapping appointments
-    const overlapping = await Appointment.findOne({
-      doctor: doctorId,
-      $or: [
-        { start: { $lt: endDate, $gte: startDate } },
-        { end: { $gt: startDate, $lte: endDate } },
-        { start: { $lte: startDate }, end: { $gte: endDate } } // existing spans requested
-      ]
-    })
-    if (overlapping) return res.status(400).json({ message: 'Requested slot overlaps an existing appointment' })
-
-    // 3) Create the appointment
-    const appointment = await Appointment.create({
-      patient: req.user._id,
-      doctor: doctorId,
-      start: startDate,
-      end: endDate,
-      reason,
-      status: 'pending'
-    })
-
-    // Notify doctor (email)
-    await sendEmail(
-      doctor.email,
-      'New Appointment Request',
-      `<p>New appointment requested on ${dateISO} at ${startDate.toISOString()}</p>`
-    )
-
-    res.status(201).json({ message: 'Appointment created', appointment })
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-// 🔁 Reschedule an appointment
->>>>>>> Stashed changes
 export const rescheduleAppointment = async (req, res) => {
   try {
     const { id } = req.params
     const { newStart, newEnd, reason } = req.body
 
     if (!newStart || !newEnd) {
-<<<<<<< Updated upstream
       return res.status(400).json({
         message: 'New start and end times are required'
       })
-=======
-      return res.status(400).json({ message: 'New start and end times are required' })
->>>>>>> Stashed changes
     }
 
     const appointment = await Appointment.findById(id)
@@ -729,7 +934,6 @@ export const rescheduleAppointment = async (req, res) => {
       return res.status(404).json({ message: 'Appointment not found' })
     }
 
-<<<<<<< Updated upstream
     // Check if appointment can be rescheduled
     if (['completed', 'cancelled'].includes(appointment.status)) {
       return res.status(400).json({
@@ -764,29 +968,9 @@ export const rescheduleAppointment = async (req, res) => {
       return res.status(400).json({ message: 'Cannot reschedule to a past date' })
     }
 
-    // Check for conflicts at new time (exclude current appointment)
-    const conflict = await Appointment.findOne({
-      _id: { $ne: id },
-      doctor: appointment.doctor._id,
-      status: { $nin: ['cancelled', 'no-show'] },
-      $or: [
-        {
-          start: { $lt: newEndDate },
-          end: { $gt: newStartDate }
-        }
-      ]
-    })
-
-    if (conflict) {
-      return res.status(400).json({
-        message: 'The new time slot is already booked'
-      })
-    }
-
-    // Validate against doctor availability
+    // ── Validate new date against doctor availability ────────────────────────
     const dateISO = newStartDate.toISOString().slice(0, 10)
     const weekday = newStartDate.getUTCDay()
-    const timeStr = `${String(newStartDate.getUTCHours()).padStart(2, '0')}:${String(newStartDate.getUTCMinutes()).padStart(2, '0')}`
 
     // Check for exceptions first
     const exception = await AvailabilityException.findOne({
@@ -835,16 +1019,80 @@ export const rescheduleAppointment = async (req, res) => {
       })
     }
 
-    // Update appointment
-    const oldStart = appointment.start
-    const oldEnd = appointment.end
+    // ── Atomic reschedule: conflict check + save in one transaction ──────────
+    // Without a transaction, a concurrent booking could pass the conflict check
+    // and write before this save completes — leaving two appointments on the
+    // same slot. snapshot readConcern ensures we see committed data only.
+    const rescheduleSession = await mongoose.startSession()
+    rescheduleSession.startTransaction({
+      readConcern: { level: 'snapshot' },
+      writeConcern: { w: 'majority' }
+    })
 
-    appointment.start = newStartDate
-    appointment.end = newEndDate
-    appointment.duration = Math.round((newEndDate - newStartDate) / (1000 * 60))
-    appointment.status = 'pending' // Require reapproval
+    let oldStart, oldEnd
+    try {
+      // Re-check for conflicts inside the transaction
+      const conflict = await Appointment.findOne({
+        _id: { $ne: id },
+        doctor: appointment.doctor._id,
+        status: { $nin: ['cancelled', 'no-show'] },
+        start: { $lt: newEndDate },
+        end: { $gt: newStartDate }
+      }).session(rescheduleSession)
 
-    await appointment.save()
+      if (conflict) {
+        await rescheduleSession.abortTransaction()
+        rescheduleSession.endSession()
+        return res.status(409).json({
+          message: 'The new time slot is already booked. Please choose a different time.',
+          conflict: true
+        })
+      }
+
+      oldStart = appointment.start
+      oldEnd = appointment.end
+
+      appointment.start = newStartDate
+      appointment.end = newEndDate
+      appointment.duration = Math.round((newEndDate - newStartDate) / (1000 * 60))
+      appointment.status = 'pending'
+      await appointment.save({ session: rescheduleSession })
+
+      await rescheduleSession.commitTransaction()
+      rescheduleSession.endSession()
+
+    } catch (err) {
+      if (rescheduleSession.inTransaction()) {
+        await rescheduleSession.abortTransaction()
+        rescheduleSession.endSession()
+      }
+      // Unique index fired — a concurrent write won the race
+      if (err.code === 11000) {
+        return res.status(409).json({
+          message: 'The new time slot was just booked by another patient. Please choose a different time.',
+          conflict: true
+        })
+      }
+      throw err
+    }
+
+    // ✅ LOG AUDIT: Appointment Rescheduled
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointment_rescheduled',
+      resourceType: 'Appointment',
+      resourceId: id,
+      details: {
+        oldStart,
+        oldEnd,
+        newStart: newStartDate,
+        newEnd: newEndDate,
+        reason: reason || null,
+        patientId: appointment.patient._id,
+        doctorId: appointment.doctor._id
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
 
     // Get user details
     const patientUser = await User.findById(appointment.patient._id)
@@ -870,89 +1118,10 @@ export const rescheduleAppointment = async (req, res) => {
     })
 
     return res.json({
-=======
-    // Authorization check: patient or doctor must own the appointment
-    if (
-      req.user.role !== 'admin' &&
-      req.user._id.toString() !== appointment.patient._id.toString() &&
-      req.user._id.toString() !== appointment.doctor._id.toString()
-    ) {
-      return res.status(403).json({ message: 'Not authorized to reschedule this appointment' })
-    }
-
-    const newStartDate = new Date(newStart)
-    const newEndDate = new Date(newEnd)
-
-    if (newStartDate >= newEndDate) {
-      return res.status(400).json({ message: 'Invalid start/end times' })
-    }
-
-    // Check overlapping appointments
-    const overlapping = await Appointment.findOne({
-      doctor: appointment.doctor._id,
-      _id: { $ne: appointment._id }, // exclude current appointment
-      $or: [
-        { start: { $lt: newEndDate, $gte: newStartDate } },
-        { end: { $gt: newStartDate, $lte: newEndDate } },
-        { start: { $lte: newStartDate }, end: { $gte: newEndDate } }
-      ]
-    })
-
-    if (overlapping) {
-      return res.status(400).json({ message: 'Requested slot overlaps another appointment' })
-    }
-
-    // 2️⃣ Log reschedule history
-    appointment.rescheduleHistory.push({
-      previousStart: appointment.start,
-      previousEnd: appointment.end,
-      newStart: newStartDate,
-      newEnd: newEndDate,
-      changedBy: req.user._id,
-      reason
-    })
-
-    // 3️⃣ Update appointment details
-    appointment.start = newStartDate
-    appointment.end = newEndDate
-    appointment.status = 'pending' // require reapproval if needed
-    await appointment.save()
-
-    // 4️⃣ Email notifications
-    const newDateStr = format(newStartDate, 'PPP')
-    const newTimeStr = format(newStartDate, 'p')
-
-    // Notify doctor
-    await sendEmail(
-      appointment.doctor.email,
-      'Appointment Rescheduled',
-      `
-        <p>Hello Dr. ${appointment.doctor.lastName},</p>
-        <p>The appointment with <strong>${appointment.patient.firstName} ${appointment.patient.lastName}</strong> has been rescheduled.</p>
-        <p><strong>New Time:</strong> ${newDateStr} at ${newTimeStr}</p>
-        <p>Reason: ${reason || 'N/A'}</p>
-      `
-    )
-
-    // Notify patient
-    await sendEmail(
-      appointment.patient.email,
-      'Appointment Rescheduled',
-      `
-        <p>Dear ${appointment.patient.firstName},</p>
-        <p>Your appointment with Dr. ${appointment.doctor.lastName} has been rescheduled.</p>
-        <p><strong>New Time:</strong> ${newDateStr} at ${newTimeStr}</p>
-        <p>Reason: ${reason || 'N/A'}</p>
-      `
-    )
-
-    res.json({
->>>>>>> Stashed changes
       message: 'Appointment rescheduled successfully',
       appointment
     })
   } catch (error) {
-<<<<<<< Updated upstream
     console.error('Reschedule appointment error:', error)
     return res.status(500).json({ message: error.message })
   }
@@ -970,6 +1139,22 @@ export const deleteAppointment = async (req, res) => {
     if (!appointment) {
       return res.status(404).json({ message: 'Appointment not found' })
     }
+
+    // ✅ LOG AUDIT: Appointment Deleted
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointment_deleted',
+      resourceType: 'Appointment',
+      resourceId: id,
+      details: {
+        doctorId: appointment.doctor,
+        patientId: appointment.patient,
+        status: appointment.status,
+        start: appointment.start,
+        end: appointment.end
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
 
     await appointment.deleteOne()
 
@@ -1018,6 +1203,20 @@ export const checkConflicts = async (req, res) => {
     }
 
     const conflict = await Appointment.findOne(query)
+
+    // ✅ LOG AUDIT: Conflict Check Performed
+    await logAudit({
+      userId: req.user.id,
+      action: 'appointment_conflict_checked',
+      resourceType: 'Appointment',
+      details: {
+        doctorId,
+        start: proposedStart,
+        end: proposedEnd,
+        conflictFound: !!conflict
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
 
     return res.json({
       hasConflict: !!conflict,
@@ -1068,6 +1267,19 @@ export const getAppointmentsByDoctor = async (req, res) => {
       })
       .sort({ start: 1 })
 
+    // ✅ LOG AUDIT: Doctor's Appointments Retrieved
+    await logAudit({
+      userId: req.user.id,
+      action: 'doctor_appointments_retrieved',
+      resourceType: 'Appointment',
+      details: {
+        doctorId,
+        filters: { status, startDate, endDate },
+        recordsReturned: appointments.length
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
+
     return res.json(appointments)
   } catch (error) {
     console.error('Get appointments by doctor error:', error)
@@ -1113,15 +1325,166 @@ export const getAppointmentsByPatient = async (req, res) => {
       })
       .sort({ start: -1 })
 
+    // ✅ LOG AUDIT: Patient's Appointments Retrieved
+    await logAudit({
+      userId: req.user.id,
+      action: 'patient_appointments_retrieved',
+      resourceType: 'Appointment',
+      details: {
+        patientId,
+        filters: { status, startDate, endDate },
+        recordsReturned: appointments.length
+      },
+      req
+    }).catch(err => console.error('Audit log error:', err))
+
     return res.json(appointments)
   } catch (error) {
     console.error('Get appointments by patient error:', error)
     return res.status(500).json({ message: error.message })
   }
 }
-=======
-    console.error('❌ Reschedule error:', error)
-    res.status(500).json({ message: error.message })
+
+// @desc    Start appointment session (idempotent)
+// @route   POST /api/appointments/:id/start-session
+// @access  Private (Doctor only)
+export const startAppointmentSession = async (req, res) => {
+  try {
+    const doctorId = req.user.id
+    const { id: appointmentId } = req.params
+
+    const appointment = await Appointment.findById(appointmentId)
+      .populate('patient', 'firstName lastName email')
+      .populate('doctor',  'firstName lastName email')
+
+    if (!appointment) {
+      return res.status(404).json({ success: false, message: 'Appointment not found' })
+    }
+
+    // ── Time-window validation ─────────────────────────────────────────────
+    const now          = new Date()
+    const earlyWindow  = 60 * 60 * 1000  // allow start up to 1 h early
+    const gracePeriod  = 30 * 60 * 1000  // allow start up to 30 min after end
+
+    if (now < new Date(appointment.start.getTime() - earlyWindow)) {
+      return res.status(400).json({
+        success: false,
+        message: `Appointment starts at ${appointment.start.toLocaleString()}. You can open it up to 1 hour early.`
+      })
+    }
+
+    if (now > new Date(appointment.end.getTime() + gracePeriod)) {
+      return res.status(400).json({
+        success: false,
+        message: 'This appointment has passed. Cannot start a session for a past appointment.'
+      })
+    }
+
+    // ── Ownership check ────────────────────────────────────────────────────
+    if (appointment.doctor._id.toString() !== doctorId) {
+      return res.status(403).json({ success: false, message: 'Not authorized to start this session.' })
+    }
+
+    // ── Status guard ───────────────────────────────────────────────────────
+    // 'in_progress' is allowed here so a doctor can click "Resume" after a
+    // browser refresh without getting blocked.
+    if (!['approved', 'in_progress'].includes(appointment.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Appointment status is '${appointment.status}'. Only approved appointments can be started.`
+      })
+    }
+
+    // ── IDEMPOTENT SESSION CHECK ───────────────────────────────────────────
+    //
+    // Root cause of the reported bug:
+    //   1. Session.create()  — succeeded, document persisted in MongoDB.
+    //   2. appointment.save() — threw ValidationError because 'in_progress'
+    //      was missing from the Appointment.status enum (fixed in Appointment.js).
+    //   3. On standalone Mongo the abortTransaction() does NOT roll back the
+    //      Session, so an orphaned Session survives in the DB.
+    //   4. Doctor retried → old code returned 400 "Session already exists".
+    //
+    // Fix: if a session already exists for this appointment, return it with
+    // HTTP 200 so the doctor lands on the consultation page cleanly.
+    // A COMPLETED session is explicitly blocked from reopening.
+    const existingSession = await Session.findOne({ appointment: appointmentId })
+      .populate('patient',      'firstName lastName email phoneNumber')
+      .populate('doctor',       'firstName lastName specialization')
+      .populate('appointment')
+      .populate('labRequests')
+      .populate('prescriptions')
+      .populate('medicalRecord')
+
+    if (existingSession) {
+      if (existingSession.status === 'completed') {
+        return res.status(400).json({
+          success: false,
+          message: 'This session has already been completed and cannot be reopened.'
+        })
+      }
+
+      console.log(`↩️  Resuming session ${existingSession._id} for appointment ${appointmentId}`)
+      return res.status(200).json({
+        success: true,
+        message: 'Resuming existing session',
+        data: { session: existingSession, appointment }
+      })
+    }
+
+    // ── Create new session atomically with appointment status update ───────
+    const mongoSession = await mongoose.startSession()
+    mongoSession.startTransaction()
+
+    let session
+    try {
+      const [created] = await Session.create(
+        [{
+          appointment: appointmentId,
+          patient:     appointment.patient._id,
+          doctor:      doctorId,
+          status:      'in_progress',
+          startTime:   new Date()
+        }],
+        { session: mongoSession }
+      )
+      session = created
+
+      // 'in_progress' is now valid in Appointment.status enum (see Appointment.js fix)
+      appointment.status = 'in_progress'
+      await appointment.save({ session: mongoSession })
+
+      await mongoSession.commitTransaction()
+    } catch (txErr) {
+      await mongoSession.abortTransaction()
+      throw txErr
+    } finally {
+      mongoSession.endSession()
+    }
+
+    await session.populate([
+      { path: 'patient',  select: 'firstName lastName email phoneNumber' },
+      { path: 'doctor',   select: 'firstName lastName specialization' },
+      { path: 'appointment' }
+    ])
+
+    // Notify patient
+    await Notification.create({
+      user:    appointment.patient._id,
+      type:    'session_started',
+      title:   'Session Started',
+      message: `Your appointment with Dr. ${appointment.doctor.lastName} has started.`,
+      data:    { sessionId: session._id, appointmentId },
+      read:    false
+    }).catch(err => console.error('Notification error:', err))
+
+    return res.status(201).json({
+      success: true,
+      message: 'Session started successfully',
+      data:    { session, appointment }
+    })
+  } catch (error) {
+    console.error('Start session error:', error)
+    return res.status(500).json({ success: false, message: error.message })
   }
 }
->>>>>>> Stashed changes

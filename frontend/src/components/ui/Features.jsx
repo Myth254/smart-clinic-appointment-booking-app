@@ -1,7 +1,7 @@
 import React from 'react';
 import { Calendar, Bell, Clock, Users, BarChart3, Shield } from 'lucide-react';
 import { useTheme } from '../../context/ThemeContext';
-import FeatureCard from '../../components/ui/FeatureCard';
+import FeatureCard from './featureCard';
 
 const Features = () => {
   const { isDark } = useTheme();

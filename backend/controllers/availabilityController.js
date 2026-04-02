@@ -1,4 +1,3 @@
-<<<<<<< Updated upstream
 /* eslint-disable no-unused-vars */
 import Availability from '../models/Availability.js'
 import AvailabilityRule from '../models/AvailabilityRule.js'
@@ -248,21 +247,10 @@ export const getAvailability = async (req, res) => {
 // @route   POST /api/availability/rules
 // @access  Private (Doctor/Admin)
 export const setAvailability = async (req, res) => {
-=======
-import AvailabilityRule from '../models/AvailabilityRule.js'
-import AvailabilityException from '../models/AvailabilityException.js'
-import Appointment from '../models/Appointment.js'
-import { generateTimeSlots, isOverlapping } from '../utils/availability.js'
-import User from '../models/User.js'
-
-// doctor creates weekly rule
-export const createRule = async (req, res) => {
->>>>>>> Stashed changes
   try {
     const doctorId = req.user._id
     const { weekday, startTime, endTime, slotDurationMinutes } = req.body
 
-<<<<<<< Updated upstream
     // Validate required fields
     if (weekday === undefined || !startTime || !endTime) {
       return res.status(400).json({
@@ -312,13 +300,6 @@ export const createRule = async (req, res) => {
     }
 
     // Create availability rule
-=======
-    // Basic validation
-    if (weekday === null || !startTime || !endTime) {
-      return res.status(400).json({ message: 'weekday, startTime and endTime are required' })
-    }
-
->>>>>>> Stashed changes
     const rule = await AvailabilityRule.create({
       doctor: doctorId,
       weekday,
@@ -327,7 +308,6 @@ export const createRule = async (req, res) => {
       slotDurationMinutes: slotDurationMinutes || 30
     })
 
-<<<<<<< Updated upstream
     res.status(201).json({
       success: true,
       message: 'Availability rule created successfully',
@@ -691,108 +671,5 @@ export const debugAvailability = async (req, res) => {
       success: false,
       message: error.message
     })
-=======
-    res.status(201).json({ message: 'Availability rule created', rule })
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-// get rules for a doctor
-export const getRulesForDoctor = async (req, res) => {
-  try {
-    const { doctorId } = req.params
-    const rules = await AvailabilityRule.find({ doctor: doctorId })
-    res.json(rules)
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-// GET available slots for doctor on a date (YYYY-MM-DD)
-export const getAvailableSlotsForDoctorOnDate = async (req, res) => {
-  try {
-    const { doctorId, date } = req.params // date e.g. '2025-10-12'
-    // validate doctor
-    const doctor = await User.findById(doctorId)
-    if (!doctor || doctor.role !== 'doctor') return res.status(400).json({ message: 'Invalid doctor' })
-
-    // 1) Check exceptions for the date
-    const exception = await AvailabilityException.findOne({ doctor: doctorId, date })
-    if (exception && exception.isAvailable && exception.slots && exception.slots.length) {
-      // return exception slots (override)
-      const slots = exception.slots.map(s => ({
-        start: s.startTime,
-        end: s.endTime,
-        label: `${s.startTime} - ${s.endTime}`
-      }))
-      return res.json({ date, slots })
-    }
-    if (exception && !exception.isAvailable) {
-      // doctor is off that day
-      return res.json({ date, slots: [] })
-    }
-
-    // 2) Get weekly rules for that weekday
-    const d = new Date(date)
-    const weekday = d.getDay() // 0-6
-    const rules = await AvailabilityRule.find({ doctor: doctorId, weekday })
-
-    // 3) Build candidate slots from rules
-    let candidateSlots = []
-    for (const rule of rules) {
-      const slots = generateTimeSlots(date, rule.startTime, rule.endTime, rule.slotDurationMinutes)
-      candidateSlots = candidateSlots.concat(slots)
-    }
-
-    // 4) Filter out slots that overlap existing appointments
-    // fetch appointments for doctor on that date
-    const dayStart = new Date(`${date}T00:00:00.000Z`)
-    const dayEnd = new Date(`${date}T23:59:59.999Z`)
-    const appointments = await Appointment.find({
-      doctor: doctorId,
-      start: { $lt: dayEnd },
-      end: { $gt: dayStart }
-    })
-
-    const available = candidateSlots.filter(slot => {
-      return !appointments.some(appt => isOverlapping(slot.start, slot.end, appt.start, appt.end))
-    })
-
-    // format response
-    const formatted = available.map(s => ({ start: s.start.toISOString(), end: s.end.toISOString(), label: s.label }))
-    res.json({ date, slots: formatted })
-  } catch (error) {
-    res.status(500).json({ message: error.message })
-  }
-}
-
-/**
- * @desc    Delete a specific availability rule
- * @route   DELETE /api/v1/availability/:id
- * @access  Doctor/Admin
- */
-export const deleteRule = async (req, res) => {
-  try {
-    const { id } = req.params
-
-    // Find the availability rule by ID
-    const rule = await AvailabilityRule.findById(id)
-
-    if (!rule) {
-      return res.status(404).json({ message: 'Availability rule not found' })
-    }
-
-    // Only the doctor who owns the rule or an admin can delete
-    if (req.user.role !== 'admin' && rule.doctor.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ message: 'Access denied' })
-    }
-
-    await rule.deleteOne()
-    res.json({ message: 'Availability rule deleted successfully' })
-  } catch (error) {
-    console.error('Error deleting availability rule:', error)
-    res.status(500).json({ message: error.message })
->>>>>>> Stashed changes
   }
 }

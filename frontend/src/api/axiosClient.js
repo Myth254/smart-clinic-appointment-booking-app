@@ -30,4 +30,14 @@ axiosClient.interceptors.response.use(
   }
 )
 
+axiosClient.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    if (error.message === "Network Error") {
+      console.warn("⚠️ Network issue. Server unreachable.");
+    }
+    return Promise.reject(error);
+  }
+);
+
 export default axiosClient

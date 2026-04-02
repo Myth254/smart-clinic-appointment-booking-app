@@ -9,6 +9,10 @@ export { default as medicalRecordsAPI } from './medicalRecords'
 export { default as notificationsAPI } from './notifications'
 export { default as patientAPI } from './patient'
 export { default as specialtyAPI } from './specialty'
-
+export { default as sessionsAPI } from './session';
+export { default as labAPI } from './lab';
+export { default as pharmacyAPI } from './pharmacy';
+export { default as paymentsAPI } from './payments';
+export { default as billingAPI } from './billing';
 // Export axios client for direct use if needed
-export { default as axiosClient } from './axiosClient' 
+export { default as axiosClient } from './axiosClient'

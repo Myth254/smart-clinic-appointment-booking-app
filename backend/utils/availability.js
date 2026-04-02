@@ -1,12 +1,13 @@
-import { addMinutes, format, isBefore, isEqual } from 'date-fns'
-<<<<<<< Updated upstream
+import { addMinutes, format, isBefore, isAfter, isEqual } from 'date-fns'
 import { toZonedTime, fromZonedTime } from 'date-fns-tz'
 
-=======
-import * as dateFnsTz from 'date-fns-tz'
+export const isSlotStillValid = (slotStartUTC, tz = TIMEZONE) => {
+  const nowLocal = toZonedTime(new Date(), tz)
+  const nowUTC = fromZonedTime(nowLocal, tz)
 
-const { zonedTimeToUtc, utcToZonedTime } = dateFnsTz
->>>>>>> Stashed changes
+  return isAfter(slotStartUTC, nowUTC) || isEqual(slotStartUTC, nowUTC)
+}
+
 const TIMEZONE = 'Africa/Nairobi'
 
 /**
@@ -14,7 +15,6 @@ const TIMEZONE = 'Africa/Nairobi'
  * Converts it to UTC internally so comparisons are accurate.
  */
 export const parseTimeOnDate = (dateISO /* 'YYYY-MM-DD' */, timeStr /* '09:00' */, tz = TIMEZONE) => {
-<<<<<<< Updated upstream
   try {
     const [hours, minutes] = timeStr.split(':').map(Number)
     const [year, month, day] = dateISO.split('-').map(Number)
@@ -30,41 +30,44 @@ export const parseTimeOnDate = (dateISO /* 'YYYY-MM-DD' */, timeStr /* '09:00' *
     console.error('Error in parseTimeOnDate:', error, { dateISO, timeStr })
     throw error
   }
-=======
-  const [hours, minutes] = timeStr.split(':').map(Number)
-  const [year, month, day] = dateISO.split('-').map(Number)
-
-  const localDate = new Date(year, month - 1, day, hours, minutes)
-  const utcDate = zonedTimeToUtc(localDate, tz)
-  return utcDate
->>>>>>> Stashed changes
 }
 
 /**
  * Generate appointment slots between startTime and endTime (in HH:mm),
  * converted from Nairobi timezone to UTC.
  */
-export const generateTimeSlots = (dateISO, startTime, endTime, slotDurationMinutes, tz = TIMEZONE) => {
-<<<<<<< Updated upstream
+export const generateTimeSlots = (
+  dateISO,
+  startTime,
+  endTime,
+  slotDurationMinutes,
+  tz = TIMEZONE
+) => {
   try {
     const slots = []
     let start = parseTimeOnDate(dateISO, startTime, tz)
     const end = parseTimeOnDate(dateISO, endTime, tz)
 
-    let safety = 0 // prevent infinite loops on bad input
+    // Current time in UTC (from Nairobi local time)
+    const nowLocal = toZonedTime(new Date(), tz)
+    const nowUTC = fromZonedTime(nowLocal, tz)
+
+    let safety = 0
     while ((isBefore(start, end) || isEqual(start, end)) && safety < 1000) {
       const slotEnd = addMinutes(start, slotDurationMinutes)
 
       if (isBefore(slotEnd, addMinutes(end, 1))) {
-        // Convert UTC times back to Nairobi for display
-        const startLocal = toZonedTime(start, tz)
-        const endLocal = toZonedTime(slotEnd, tz)
+        // Only include slot if it is >= current time
+        if (isAfter(start, nowUTC) || isEqual(start, nowUTC)) {
+          const startLocal = toZonedTime(start, tz)
+          const endLocal = toZonedTime(slotEnd, tz)
 
-        slots.push({
-          start, // stored in UTC
-          end: slotEnd, // stored in UTC
-          label: `${format(startLocal, 'HH:mm')} - ${format(endLocal, 'HH:mm')}`, // readable in Nairobi time
-        })
+          slots.push({
+            start,
+            end: slotEnd,
+            label: `${format(startLocal, 'HH:mm')} - ${format(endLocal, 'HH:mm')}`,
+          })
+        }
       }
 
       start = slotEnd
@@ -73,38 +76,14 @@ export const generateTimeSlots = (dateISO, startTime, endTime, slotDurationMinut
 
     return slots
   } catch (error) {
-    console.error('Error in generateTimeSlots:', error, { dateISO, startTime, endTime, slotDurationMinutes })
+    console.error('Error in generateTimeSlots:', error)
     throw error
   }
-=======
-  const slots = []
-  let start = parseTimeOnDate(dateISO, startTime, tz)
-  const end = parseTimeOnDate(dateISO, endTime, tz)
-
-  while (isBefore(start, end) || isEqual(start, end)) {
-    const slotEnd = addMinutes(start, slotDurationMinutes)
-    if (isBefore(slotEnd, addMinutes(end, 1))) {
-      const startLocal = utcToZonedTime(start, tz)
-      const endLocal = utcToZonedTime(slotEnd, tz)
-
-      slots.push({
-        start, // stored in UTC
-        end: slotEnd, // stored in UTC
-        label: `${format(startLocal, 'HH:mm')} - ${format(endLocal, 'HH:mm')}`, // display in Nairobi time
-      })
-    }
-    start = slotEnd
-  }
-  return slots
->>>>>>> Stashed changes
 }
 
 /**
  * Check overlap between two time intervals
-<<<<<<< Updated upstream
  * Returns true if overlap exists
-=======
->>>>>>> Stashed changes
  */
 export const isOverlapping = (aStart, aEnd, bStart, bEnd) => {
   return aStart < bEnd && bStart < aEnd

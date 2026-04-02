@@ -28,7 +28,7 @@ export const AuthProvider = ({ children }) => {
           // ✅ Normalize user data from backend
           const normalizedUser = normalizeUser(data);
           
-          if (process.env.NODE_ENV === 'development') {
+          if (typeof window !== 'undefined') {
             console.log('✅ User loaded:', normalizedUser);
           }
           
@@ -80,7 +80,7 @@ export const AuthProvider = ({ children }) => {
       setToken(data.token);
       setUser(normalizedUser);
 
-      if (process.env.NODE_ENV === 'development') {
+      if (typeof window !== 'undefined') {
         console.log('✅ Login successful:', normalizedUser.email);
       }
 
@@ -109,7 +109,7 @@ export const AuthProvider = ({ children }) => {
       setToken(data.token);
       setUser(normalizedUser);
 
-      if (process.env.NODE_ENV === 'development') {
+      if (typeof window !== 'undefined') {
         console.log('✅ Registration successful:', normalizedUser.email);
       }
 
@@ -130,7 +130,7 @@ export const AuthProvider = ({ children }) => {
       // Call logout API endpoint
       await authAPI.logout();
       
-      if (process.env.NODE_ENV === 'development') {
+      if (typeof window !== 'undefined') {
         console.log('✅ Logout successful');
       }
     } catch (error) {
@@ -156,7 +156,7 @@ export const AuthProvider = ({ children }) => {
       // ✅ Sync to localStorage
       localStorage.setItem('user', JSON.stringify(updatedUser));
       
-      if (process.env.NODE_ENV === 'development') {
+      if (typeof window !== 'undefined') {
         console.log('✅ User updated:', updatedUser);
       }
       

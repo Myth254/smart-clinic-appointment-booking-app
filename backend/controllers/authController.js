@@ -5,10 +5,12 @@ import jwt from 'jsonwebtoken'
 import User from '../models/User.js'
 import Patient from '../models/Patient.js'
 import Doctor from '../models/Doctor.js'
-import { LabPersonnel, PharmacyStaff } from '../models/StaffModels.js'
+import { LabPersonnel } from '../models/LabPersonnel.js'
+import { PharmacyStaff } from '../models/PharmacyStaff.js'
 import Notification from '../models/Notification.js'
 import generateToken, { generateRefreshToken } from '../utils/generateToken.js'
 import sendEmail from '../utils/sendEmail.js'
+import logAudit from '../utils/auditLogger.js'
 
 // @desc    Register new user
 // @route   POST /api/auth/register
@@ -204,17 +206,32 @@ const registerUser = async (req, res) => {
       html: `
         <h1>Welcome to MediBook, ${firstName}!</h1>
         <p>Your ${roleDisplayName} account has been successfully created.</p>
-        <p>You can now login and start using the platform.</p>
+        <p>You can now log in using your email address and the password provided during registration.</p>
         ${userRole === 'patient' ? '<p>Book appointments and manage your health records easily.</p>' : ''}
         ${userRole === 'doctor' ? '<p>Manage your appointments and patient records.</p>' : ''}
         ${userRole === 'lab_personnel' ? '<p>Process lab requests and upload results.</p>' : ''}
         ${userRole === 'pharmacy_staff' ? '<p>Manage prescriptions and medication dispensing.</p>' : ''}
+        <p>If this account was created by an administrator, please change your password immediately after your first login.</p>
       `
     }).catch(err => console.error('Email send error:', err))
 
     // Generate tokens
     const accessToken = generateToken(user._id, user.role)
     const refreshToken = generateRefreshToken(user._id)
+
+    await logAudit({
+      userId: user._id,
+      action: 'USER_REGISTERED',
+      resourceType: 'User',
+      resourceId: user._id,
+      details: {
+        email: user.email,
+        role: user.role,
+        registeredBy: req.user?.id || 'self'
+      },
+      req,
+      status: 'success'
+    })
 
     return res.status(201).json({
       message: 'User registered successfully',
@@ -256,15 +273,16 @@ const loginUser = async (req, res) => {
       return res.status(401).json({ message: 'Invalid email or password' })
     }
 
-    if (user.status !== 'active') {
-      return res.status(403).json({
-        message: 'Your account is currently inactive. Please contact support.'
-      })
-    }
-
     const isPasswordMatch = await user.comparePassword(password)
     if (!isPasswordMatch) {
       return res.status(401).json({ message: 'Invalid email or password' })
+    }
+
+    // Check account status AFTER verifying credentials to prevent email enumeration
+    if (user.status !== 'active') {
+      return res.status(403).json({
+        message: 'Your account is currently inactive or suspended. Please contact support.'
+      })
     }
 
     // Update last login
@@ -282,6 +300,20 @@ const loginUser = async (req, res) => {
 
     const accessToken = generateToken(user._id, user.role)
     const refreshToken = generateRefreshToken(user._id)
+
+    await logAudit({
+      userId: user._id,
+      action: 'USER_LOGIN',
+      resourceType: 'User',
+      resourceId: user._id,
+      details: {
+        email: user.email,
+        role: user.role,
+        lastLogin: user.lastLogin
+      },
+      req,
+      status: 'success'
+    })
 
     return res.json({
       message: 'Login successful',
@@ -302,6 +334,19 @@ const loginUser = async (req, res) => {
     })
   } catch (error) {
     console.error('Login error:', error)
+    await logAudit({
+      userId: null,
+      action: 'USER_LOGIN_FAILED',
+      resourceType: 'User',
+      resourceId: null,
+      details: {
+        email: '',
+        reason: 'Invalid credentials'
+      },
+      req,
+      status: 'failure',
+      errorMessage: 'Invalid email or password'
+    })
     return res.status(500).json({ message: error.message })
   }
 }
@@ -541,6 +586,19 @@ const resetPassword = async (req, res) => {
         <p>Best regards,<br>MediBook Team</p>
       `
     }).catch(err => console.error('Email send error:', err))
+
+    await logAudit({
+      userId: user._id,
+      action: 'PASSWORD_RESET',
+      resourceType: 'User',
+      resourceId: user._id,
+      details: {
+        email: user.email,
+        resetMethod: 'token'
+      },
+      req,
+      status: 'success'
+    })
 
     return res.json({
       message: 'Password reset successful. You can now login with your new password.',

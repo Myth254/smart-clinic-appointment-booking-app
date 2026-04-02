@@ -24,6 +24,11 @@ export const doctorAPI = {
     return response.data;
   },
 
+  getDoctorStats: async () => {
+    const response = await axiosClient.get('/doctors/stats');
+    return response.data;
+  },
+
   // Appointment routes
   getAppointments: async (params = {}) => {
     const response = await axiosClient.get('/doctors/appointments', { params });

@@ -1,18 +1,20 @@
-// controllers/notificationController.js
+// controllers/notificationController.js - ENHANCED VERSION
+import mongoose from 'mongoose'
 import Notification from '../models/Notification.js'
 import User from '../models/User.js'
 import Setting from '../models/Setting.js'
-import sendEmail from '../utils/sendEmail.js'
+import NotificationService from '../services/notificationService.js'
+import { updateUnreadCount } from '../socket.js'
 
-// @desc    Get user notifications
+// @desc    Get user notifications with filtering
 // @route   GET /api/notifications
 // @access  Private
 export const getNotifications = async (req, res) => {
   try {
-    const { read, type, limit = 20, offset = 0 } = req.query
+    const { read, type, priority, limit = 20, offset = 0 } = req.query
 
     // Build query
-    const query = { user: req.user.id }
+    const query = { user: req.user.id, status: 'active' }
 
     if (read !== undefined) {
       query.read = read === 'true'
@@ -22,17 +24,33 @@ export const getNotifications = async (req, res) => {
       query.type = type
     }
 
+    if (priority) {
+      query.priority = priority
+    }
+
+    // ✅ Exclude expired notifications
+    query.$or = [
+      { expiresAt: null },
+      { expiresAt: { $gt: new Date() } }
+    ]
+
     // Get notifications
     const notifications = await Notification.find(query)
-      .sort({ sentAt: -1 })
+      .sort({ priority: -1, createdAt: -1 }) // ✅ Sort by priority first
       .limit(parseInt(limit))
       .skip(parseInt(offset))
+      .populate('relatedId') // ✅ Populate related resource if needed
 
     // Get total count
     const total = await Notification.countDocuments(query)
     const unreadCount = await Notification.countDocuments({
       user: req.user.id,
-      read: false
+      status: 'active',
+      read: false,
+      $or: [
+        { expiresAt: null },
+        { expiresAt: { $gt: new Date() } }
+      ]
     })
 
     return res.json({
@@ -71,10 +89,21 @@ export const markAsRead = async (req, res) => {
       })
     }
 
+    // ✅ Check if already read
+    if (notification.read) {
+      return res.json({
+        message: 'Notification already marked as read',
+        notification
+      })
+    }
+
     // Update notification
     notification.read = true
     notification.readAt = new Date()
     await notification.save()
+
+    // ✅ Update real-time unread count via Socket.IO
+    await updateUnreadCount(req.user.id)
 
     return res.json({
       message: 'Notification marked as read',
@@ -92,12 +121,23 @@ export const markAsRead = async (req, res) => {
 export const markAllAsRead = async (req, res) => {
   try {
     const result = await Notification.updateMany(
-      { user: req.user.id, read: false },
+      {
+        user: req.user.id,
+        status: 'active',
+        read: false,
+        $or: [
+          { expiresAt: null },
+          { expiresAt: { $gt: new Date() } }
+        ]
+      },
       {
         read: true,
         readAt: new Date()
       }
     )
+
+    // ✅ Update real-time unread count via Socket.IO
+    await updateUnreadCount(req.user.id)
 
     return res.json({
       message: 'All notifications marked as read',
@@ -130,6 +170,11 @@ export const deleteNotification = async (req, res) => {
     }
 
     await notification.deleteOne()
+
+    // ✅ Update unread count if notification was unread
+    if (!notification.read) {
+      await updateUnreadCount(req.user.id)
+    }
 
     return res.json({
       message: 'Notification deleted successfully'
@@ -167,7 +212,12 @@ export const getUnreadCount = async (req, res) => {
   try {
     const unreadCount = await Notification.countDocuments({
       user: req.user.id,
-      read: false
+      status: 'active',
+      read: false,
+      $or: [
+        { expiresAt: null },
+        { expiresAt: { $gt: new Date() } }
+      ]
     })
 
     return res.json({ unreadCount })
@@ -177,33 +227,39 @@ export const getUnreadCount = async (req, res) => {
   }
 }
 
-// @desc    Send custom notification (Admin only)
+// @desc    Send custom notification (Admin only) - WITH TRANSACTION
 // @route   POST /api/notifications/send
 // @access  Private (Admin)
 export const sendCustomNotification = async (req, res) => {
+  const session = await mongoose.startSession()
+  session.startTransaction()
+
   try {
     const {
       userIds,
       title,
       message,
       type = 'system',
-      sendEmail: shouldSendEmail = false,
-      sendSMS: shouldSendSMS = false,
+      priority = 'normal',
+      channels = ['in_app'],
       data
     } = req.body
 
     // Validate required fields
     if (!title || !message) {
+      await session.abortTransaction()
       return res.status(400).json({
         message: 'Title and message are required'
       })
     }
 
     // Validate notification type
-    const validTypes = ['appointment', 'reminder', 'cancellation', 'rescheduled', 'message', 'system']
+    const validTypes = ['appointment', 'session', 'lab', 'prescription', 'payment', 'medical_record', 'system', 'reminder', 'alert']
     if (!validTypes.includes(type)) {
+      await session.abortTransaction()
       return res.status(400).json({
-        message: 'Invalid notification type'
+        message: 'Invalid notification type',
+        validTypes
       })
     }
 
@@ -214,64 +270,41 @@ export const sendCustomNotification = async (req, res) => {
       targetUsers = await User.find({
         _id: { $in: userIds },
         status: 'active'
-      })
+      }).session(session)
 
       if (targetUsers.length === 0) {
+        await session.abortTransaction()
         return res.status(404).json({
           message: 'No valid users found'
         })
       }
     } else {
       // If no userIds, send to all active users
-      targetUsers = await User.find({ status: 'active' })
+      targetUsers = await User.find({ status: 'active' }).session(session)
     }
 
-    // Create notifications in bulk
-    const notifications = targetUsers.map(user => ({
-      user: user._id,
+    // ✅ Use NotificationService for consistent delivery
+    const notificationData = {
       type,
       title,
       message,
       data: data || {},
-      read: false,
-      sentAt: new Date()
-    }))
-
-    const createdNotifications = await Notification.insertMany(notifications)
-
-    // Send emails if requested
-    if (shouldSendEmail) {
-      const emailPromises = targetUsers.map(user =>
-        sendEmail({
-          to: user.email,
-          subject: title,
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2>${title}</h2>
-              <p>${message}</p>
-              <hr style="border: 1px solid #eee; margin: 20px 0;">
-              <p style="font-size: 12px; color: #666;">
-                This is an automated notification from MediBook.
-              </p>
-            </div>
-          `
-        }).catch(err => {
-          console.error(`Failed to send email to ${user.email}:`, err)
-          return null
-        })
-      )
-
-      await Promise.allSettled(emailPromises)
+      priority,
+      channels
     }
 
-    // TODO: Implement SMS sending if shouldSendSMS is true
-    if (shouldSendSMS) {
-      console.log('SMS sending not implemented yet')
-    }
+    const results = await NotificationService.sendToMultiple(
+      targetUsers.map(u => u._id),
+      notificationData
+    )
+
+    await session.commitTransaction()
 
     return res.status(201).json({
       message: 'Notifications sent successfully',
-      count: createdNotifications.length,
+      total: results.total,
+      successful: results.successful,
+      failed: results.failed,
       sentTo: targetUsers.map(u => ({
         id: u._id,
         email: u.email,
@@ -279,36 +312,45 @@ export const sendCustomNotification = async (req, res) => {
       }))
     })
   } catch (error) {
+    await session.abortTransaction()
     console.error('Send custom notification error:', error)
     return res.status(500).json({ message: error.message })
+  } finally {
+    session.endSession()
   }
 }
 
-// @desc    Send notification to specific role
+// @desc    Send notification to specific role - WITH TRANSACTION
 // @route   POST /api/notifications/send-to-role
 // @access  Private (Admin)
 export const sendNotificationToRole = async (req, res) => {
+  const session = await mongoose.startSession()
+  session.startTransaction()
+
   try {
     const {
       role,
       title,
       message,
       type = 'system',
-      sendEmail: shouldSendEmail = false,
+      priority = 'normal',
+      channels = ['in_app'],
       data
     } = req.body
 
     // Validate required fields
     if (!role || !title || !message) {
+      await session.abortTransaction()
       return res.status(400).json({
         message: 'Role, title, and message are required'
       })
     }
 
     // Validate role
-    if (!['patient', 'doctor', 'admin'].includes(role)) {
+    if (!['patient', 'doctor', 'lab_personnel', 'pharmacy_staff', 'admin'].includes(role)) {
+      await session.abortTransaction()
       return res.status(400).json({
-        message: 'Invalid role. Must be: patient, doctor, or admin'
+        message: 'Invalid role. Must be: patient, doctor, lab_personnel, pharmacy_staff, or admin'
       })
     }
 
@@ -316,74 +358,227 @@ export const sendNotificationToRole = async (req, res) => {
     const targetUsers = await User.find({
       role,
       status: 'active'
-    })
+    }).session(session)
 
     if (targetUsers.length === 0) {
+      await session.abortTransaction()
       return res.status(404).json({
         message: `No active ${role}s found`
       })
     }
 
-    // Create notifications
-    const notifications = targetUsers.map(user => ({
-      user: user._id,
+    // ✅ Use NotificationService
+    const results = await NotificationService.sendToRole(role, {
       type,
       title,
       message,
       data: data || {},
-      read: false,
-      sentAt: new Date()
-    }))
+      priority,
+      channels
+    })
 
-    const createdNotifications = await Notification.insertMany(notifications)
-
-    // Send emails if requested
-    if (shouldSendEmail) {
-      const emailPromises = targetUsers.map(user =>
-        sendEmail({
-          to: user.email,
-          subject: title,
-          html: `
-            <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-              <h2>${title}</h2>
-              <p>Hello ${user.firstName},</p>
-              <p>${message}</p>
-              <hr style="border: 1px solid #eee; margin: 20px 0;">
-              <p style="font-size: 12px; color: #666;">
-                This message was sent to all ${role}s in the system.
-              </p>
-            </div>
-          `
-        }).catch(err => {
-          console.error(`Failed to send email to ${user.email}:`, err)
-          return null
-        })
-      )
-
-      await Promise.allSettled(emailPromises)
-    }
+    await session.commitTransaction()
 
     return res.status(201).json({
       message: `Notifications sent to all ${role}s successfully`,
-      count: createdNotifications.length,
+      total: results.total,
+      successful: results.successful,
+      failed: results.failed,
       role: role
     })
   } catch (error) {
+    await session.abortTransaction()
     console.error('Send notification to role error:', error)
+    return res.status(500).json({ message: error.message })
+  } finally {
+    session.endSession()
+  }
+}
+
+// @desc    Get notification statistics
+// @route   GET /api/notifications/stats
+// @access  Private
+export const getNotificationStats = async (req, res) => {
+  try {
+    const userId = req.user.id
+
+    const stats = await Notification.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          status: 'active',
+          $or: [
+            { expiresAt: null },
+            { expiresAt: { $gt: new Date() } }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: null,
+          total: { $sum: 1 },
+          unread: {
+            $sum: { $cond: [{ $eq: ['$read', false] }, 1, 0] }
+          },
+          read: {
+            $sum: { $cond: [{ $eq: ['$read', true] }, 1, 0] }
+          }
+        }
+      }
+    ])
+
+    const typeStats = await Notification.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          status: 'active',
+          $or: [
+            { expiresAt: null },
+            { expiresAt: { $gt: new Date() } }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: '$type',
+          count: { $sum: 1 },
+          unread: {
+            $sum: { $cond: [{ $eq: ['$read', false] }, 1, 0] }
+          }
+        }
+      }
+    ])
+
+    // ✅ Add priority breakdown
+    const priorityStats = await Notification.aggregate([
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(userId),
+          status: 'active',
+          read: false,
+          $or: [
+            { expiresAt: null },
+            { expiresAt: { $gt: new Date() } }
+          ]
+        }
+      },
+      {
+        $group: {
+          _id: '$priority',
+          count: { $sum: 1 }
+        }
+      }
+    ])
+
+    const result = stats[0] || { total: 0, unread: 0, read: 0 }
+
+    return res.json({
+      total: result.total,
+      unread: result.unread,
+      read: result.read,
+      byType: typeStats.reduce((acc, stat) => {
+        acc[stat._id] = {
+          total: stat.count,
+          unread: stat.unread
+        }
+        return acc
+      }, {}),
+      byPriority: priorityStats.reduce((acc, stat) => {
+        acc[stat._id] = stat.count
+        return acc
+      }, {})
+    })
+  } catch (error) {
+    console.error('Get notification stats error:', error)
     return res.status(500).json({ message: error.message })
   }
 }
 
-// @desc    Get notification templates
-// @route   GET /api/notifications/templates
+// ✅ NEW: Get notification delivery status
+// @route   GET /api/notifications/:id/delivery-status
+// @access  Private
+export const getDeliveryStatus = async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const notification = await Notification.findById(id)
+
+    if (!notification) {
+      return res.status(404).json({ message: 'Notification not found' })
+    }
+
+    // Verify ownership
+    if (notification.user.toString() !== req.user.id) {
+      return res.status(403).json({ message: 'Not authorized' })
+    }
+
+    return res.json({
+      notificationId: notification._id,
+      deliveryStatus: notification.deliveryStatus,
+      channels: notification.channels,
+      deliveryError: notification.deliveryError,
+      retryCount: notification.retryCount,
+      lastRetryAt: notification.lastRetryAt
+    })
+  } catch (error) {
+    console.error('Get delivery status error:', error)
+    return res.status(500).json({ message: error.message })
+  }
+}
+
+// ✅ NEW: Retry failed notification
+// @route   POST /api/notifications/:id/retry
 // @access  Private (Admin)
+export const retryFailedNotification = async (req, res) => {
+  try {
+    const { id } = req.params
+
+    const notification = await Notification.findById(id)
+
+    if (!notification) {
+      return res.status(404).json({ message: 'Notification not found' })
+    }
+
+    if (!notification.canRetry()) {
+      return res.status(400).json({
+        message: 'Cannot retry this notification',
+        reason: notification.retryCount >= 3 ? 'Max retries exceeded' : 'Not in failed state'
+      })
+    }
+
+    await notification.retry()
+
+    // Attempt re-delivery
+    const user = await User.findById(notification.user)
+    if (user) {
+      await NotificationService.send({
+        userId: user._id,
+        type: notification.type,
+        title: notification.title,
+        message: notification.message,
+        data: notification.metadata,
+        priority: notification.priority,
+        channels: notification.channels.map(ch => ch.type)
+      })
+    }
+
+    return res.json({
+      message: 'Notification retry initiated',
+      notification
+    })
+  } catch (error) {
+    console.error('Retry notification error:', error)
+    return res.status(500).json({ message: error.message })
+  }
+}
+
+// Template management routes (existing code remains the same)
 export const getNotificationTemplates = async (req, res) => {
   try {
     const templates = await Setting.find({
       category: 'notification'
     }).sort({ key: 1 })
 
-    // Organize templates by key
     const organized = templates.reduce((acc, template) => {
       acc[template.key] = {
         value: template.value,
@@ -403,9 +598,6 @@ export const getNotificationTemplates = async (req, res) => {
   }
 }
 
-// @desc    Get specific notification template
-// @route   GET /api/notifications/templates/:key
-// @access  Private (Admin)
 export const getNotificationTemplate = async (req, res) => {
   try {
     const { key } = req.params
@@ -428,9 +620,6 @@ export const getNotificationTemplate = async (req, res) => {
   }
 }
 
-// @desc    Update notification template
-// @route   PUT /api/notifications/templates/:key
-// @access  Private (Admin)
 export const updateTemplate = async (req, res) => {
   try {
     const { key } = req.params
@@ -466,9 +655,6 @@ export const updateTemplate = async (req, res) => {
   }
 }
 
-// @desc    Create notification template
-// @route   POST /api/notifications/templates
-// @access  Private (Admin)
 export const createTemplate = async (req, res) => {
   try {
     const { key, value, description } = req.body
@@ -479,7 +665,6 @@ export const createTemplate = async (req, res) => {
       })
     }
 
-    // Check if template already exists
     const existingTemplate = await Setting.findOne({
       key,
       category: 'notification'
@@ -509,9 +694,6 @@ export const createTemplate = async (req, res) => {
   }
 }
 
-// @desc    Delete notification template
-// @route   DELETE /api/notifications/templates/:key
-// @access  Private (Admin)
 export const deleteTemplate = async (req, res) => {
   try {
     const { key } = req.params
@@ -536,65 +718,6 @@ export const deleteTemplate = async (req, res) => {
     })
   } catch (error) {
     console.error('Delete template error:', error)
-    return res.status(500).json({ message: error.message })
-  }
-}
-
-// @desc    Get notification statistics
-// @route   GET /api/notifications/stats
-// @access  Private
-export const getNotificationStats = async (req, res) => {
-  try {
-    const userId = req.user.id
-
-    const stats = await Notification.aggregate([
-      { $match: { user: userId } },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: 1 },
-          unread: {
-            $sum: { $cond: [{ $eq: ['$read', false] }, 1, 0] }
-          },
-          read: {
-            $sum: { $cond: [{ $eq: ['$read', true] }, 1, 0] }
-          },
-          byType: {
-            $push: '$type'
-          }
-        }
-      }
-    ])
-
-    const typeStats = await Notification.aggregate([
-      { $match: { user: userId } },
-      {
-        $group: {
-          _id: '$type',
-          count: { $sum: 1 },
-          unread: {
-            $sum: { $cond: [{ $eq: ['$read', false] }, 1, 0] }
-          }
-        }
-      }
-    ])
-
-    const result = stats[0] || { total: 0, unread: 0, read: 0 }
-
-    return res.json({
-      total: result.total,
-      unread: result.unread,
-      read: result.read,
-      byType: typeStats.reduce((acc, stat) => {
-        acc[stat._id] = {
-          total: stat.count,
-          unread: stat.unread
-        }
-        return acc
-      }, {})
-    })
-  } catch (error) {
-    console.error('Get notification stats error:', error)
     return res.status(500).json({ message: error.message })
   }
 }

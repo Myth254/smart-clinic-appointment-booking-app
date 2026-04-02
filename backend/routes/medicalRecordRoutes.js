@@ -9,7 +9,8 @@ import {
   updateRecord,
   uploadAttachment,
   deleteAttachment,
-  getMyRecords
+  getMyRecords,
+  finalizeMedicalRecord
 } from '../controllers/medicalRecordController.js'
 
 const router = express.Router()
@@ -50,5 +51,7 @@ router.get('/patient/:patientId', getPatientRecords)
 // Get all medical records created by a specific doctor
 // Accessible by: doctor (own records) or admin
 router.get('/doctor/:doctorId', authorize('doctor', 'admin'), getDoctorRecords)
+
+router.post('/:recordId/finalize',protect, authorize('doctor'), finalizeMedicalRecord)
 
 export default router

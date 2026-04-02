@@ -1,14 +1,30 @@
+// api/notifications.js - FIXED VERSION
 import axiosClient from './axiosClient'
 
 export const notificationsAPI = {
-  // User notification routes
-  getNotifications: async (params = {}) => {
-    const response = await axiosClient.get('/notifications', { params });
-    return response.data;
+  // ✅ FIXED: Now properly awaits and returns data
+  getNotifications: async (params = {}, config = {}) => {
+    const controller = new AbortController();
+    config.signal = controller.signal;
+
+    try {
+      const response = await axiosClient.get('/notifications', { params, ...config });
+
+      // ✅ Return the actual data, not the promise
+      return response.data;
+    } catch (error) {
+      // Re-throw abort errors as-is so components can handle them
+      if (error.name === 'CanceledError' || error.name === 'AbortError') {
+        throw error;
+      }
+
+      // Re-throw other errors
+      throw error;
+    }
   },
 
-  getUnreadCount: async () => {
-    const response = await axiosClient.get('/notifications/unread-count');
+  getUnreadCount: async (config = {}) => {
+    const response = await axiosClient.get('/notifications/unread-count', config);
     return response.data;
   },
 
@@ -71,6 +87,18 @@ export const notificationsAPI = {
 
   deleteTemplate: async (key) => {
     const response = await axiosClient.delete(`/notifications/templates/${key}`);
+    return response.data;
+  },
+
+  // ✅ NEW: Delivery status endpoint
+  getDeliveryStatus: async (notificationId) => {
+    const response = await axiosClient.get(`/notifications/${notificationId}/delivery-status`);
+    return response.data;
+  },
+
+  // ✅ NEW: Retry failed notification
+  retryFailedNotification: async (notificationId) => {
+    const response = await axiosClient.post(`/notifications/${notificationId}/retry`);
     return response.data;
   },
 };

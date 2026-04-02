@@ -9,6 +9,26 @@ const timeToMinutes = (timeStr) => {
   return hours * 60 + minutes;
 };
 
+// ── FIX E: centralised status display maps ────────────────────────────────────
+const STATUS_LABEL = {
+  pending:     'Pending',
+  approved:    'Confirmed',
+  in_progress: 'In Progress',
+  completed:   'Completed',
+  cancelled:   'Cancelled',
+  'no-show':   'No Show',
+};
+
+const STATUS_COLOR = {
+  pending:     'bg-yellow-100 text-yellow-800',
+  approved:    'bg-green-100 text-green-800',
+  in_progress: 'bg-purple-100 text-purple-800',
+  completed:   'bg-blue-100 text-blue-800',
+  cancelled:   'bg-red-100 text-red-800',
+  'no-show':   'bg-orange-100 text-orange-800',
+};
+// ─────────────────────────────────────────────────────────────────────────────
+
 const DoctorModals = ({
   // Availability Modal
   showAvailabilityModal,
@@ -32,7 +52,8 @@ const DoctorModals = ({
   selectedAppointment,
   handleUpdateStatus,
   handleSelectAppointment,
-  
+  onStartSession,   // FIX B: (appointment) => void — switches tab and starts session
+
   loading
 }) => {
   
@@ -72,7 +93,7 @@ const DoctorModals = ({
     <>
       {/* Set Availability Modal */}
       {showAvailabilityModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-lg max-w-md w-full">
             <div className="p-6 border-b border-gray-200">
               <div className="flex justify-between items-center">
@@ -196,7 +217,7 @@ const DoctorModals = ({
 
       {/* Block Time Modal */}
       {showBlockTimeModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-lg max-w-md w-full">
             <div className="p-6 border-b border-gray-200">
               <div className="flex justify-between items-center">
@@ -251,7 +272,7 @@ const DoctorModals = ({
 
       {/* Appointment Details Modal */}
       {showAppointmentDetails && selectedAppointment && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+        <div className="fixed inset-0 bg-black/20 backdrop-blur-sm flex items-center justify-center p-4 z-50">
           <div className="bg-white rounded-lg max-w-2xl w-full">
             <div className="p-6 border-b border-gray-200">
               <div className="flex justify-between items-center">
@@ -333,17 +354,10 @@ const DoctorModals = ({
                     <p className="text-xs text-gray-500 mb-1">Status</p>
                     <span
                       className={`inline-block px-3 py-1 text-xs font-medium rounded-full ${
-                        selectedAppointment.status === 'approved'
-                          ? 'bg-green-100 text-green-800'
-                          : selectedAppointment.status === 'completed'
-                            ? 'bg-blue-100 text-blue-800'
-                            : selectedAppointment.status === 'pending'
-                              ? 'bg-yellow-100 text-yellow-800'
-                              : 'bg-gray-100 text-gray-800'
+                        STATUS_COLOR[selectedAppointment.status] || 'bg-gray-100 text-gray-800'
                       }`}
                     >
-                      {selectedAppointment.status.charAt(0).toUpperCase() +
-                        selectedAppointment.status.slice(1)}
+                      {STATUS_LABEL[selectedAppointment.status] || selectedAppointment.status}
                     </span>
                   </div>
                 </div>
@@ -362,7 +376,7 @@ const DoctorModals = ({
 
               <div className="flex space-x-3">
                 {selectedAppointment.status === 'pending' && (
-                  <>
+                  <div className="w-full space-y-3">
                     <button
                       onClick={() => {
                         handleUpdateStatus(
@@ -373,67 +387,125 @@ const DoctorModals = ({
                         setShowAppointmentDetails(false);
                       }}
                       disabled={loading}
-                      className="flex-1 bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800 disabled:opacity-50"
+                      className="w-full bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800 disabled:opacity-50"
                     >
-                      Confirm Appointment
+                      {loading ? 'Confirming...' : 'Confirm Appointment'}
                     </button>
-                    <button
-                      onClick={() => {
-                        handleUpdateStatus(
-                          selectedAppointment._id,
-                          'cancelled',
-                          'Cancelled by doctor'
-                        );
-                        setShowAppointmentDetails(false);
-                      }}
-                      disabled={loading}
-                      className="flex-1 border border-red-300 text-red-600 py-2 px-4 rounded-lg hover:bg-red-50 disabled:opacity-50"
-                    >
-                      Cancel
-                    </button>
-                  </>
+                    <p className="text-xs text-gray-500 text-center">
+                      ℹ️ Note: Patients can cancel appointments from their dashboard
+                    </p>
+                  </div>
                 )}
+
                 {selectedAppointment.status === 'approved' && (
-                  <>
+                  <div className="w-full space-y-3">
+                    {/* FIX B: primary CTA — start a session and navigate to the sessions tab */}
                     <button
                       onClick={() => {
-                        handleUpdateStatus(
-                          selectedAppointment._id,
-                          'completed',
-                          'Visit completed'
-                        );
                         setShowAppointmentDetails(false);
+                        if (onStartSession) onStartSession(selectedAppointment);
                       }}
                       disabled={loading}
-                      className="flex-1 bg-blue-600 text-white py-2 px-4 rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                      className="w-full bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800 disabled:opacity-50"
                     >
-                      Mark as Completed
+                      Start Session
                     </button>
+                    <div className="flex space-x-3">
+                      <button
+                        onClick={() => {
+                          handleUpdateStatus(
+                            selectedAppointment._id,
+                            'completed',
+                            'Visit completed'
+                          );
+                          setShowAppointmentDetails(false);
+                        }}
+                        disabled={loading}
+                        className="flex-1 border border-gray-300 py-2 px-4 rounded-lg hover:bg-gray-50 disabled:opacity-50 text-sm"
+                      >
+                        Mark as Completed
+                      </button>
+                      <button
+                        onClick={() => {
+                          handleSelectAppointment(selectedAppointment);
+                          setShowAppointmentDetails(false);
+                        }}
+                        className="flex-1 border border-gray-300 py-2 px-4 rounded-lg hover:bg-gray-50 text-sm"
+                      >
+                        Create Medical Record
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {/* FIX E: in_progress — doctor can resume the live session */}
+                {selectedAppointment.status === 'in_progress' && (
+                  <div className="w-full space-y-3">
+                    <div className="bg-purple-50 border border-purple-200 rounded-lg p-3">
+                      <p className="text-sm text-purple-800">
+                        A session is currently in progress for this appointment.
+                      </p>
+                    </div>
+                    <button
+                      onClick={() => {
+                        setShowAppointmentDetails(false);
+                        if (onStartSession) onStartSession(selectedAppointment);
+                      }}
+                      disabled={loading}
+                      className="w-full bg-purple-600 text-white py-2 px-4 rounded-lg hover:bg-purple-700 disabled:opacity-50"
+                    >
+                      Resume Session
+                    </button>
+                  </div>
+                )}
+
+                {selectedAppointment.status === 'completed' && (
+                  <div className="w-full space-y-3">
+                    <div className="bg-blue-50 border border-blue-200 rounded-lg p-3">
+                      <p className="text-sm text-blue-800">
+                        ✓ This appointment is completed and cannot be modified.
+                      </p>
+                    </div>
                     <button
                       onClick={() => {
                         handleSelectAppointment(selectedAppointment);
                         setShowAppointmentDetails(false);
                       }}
-                      className="flex-1 bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800"
+                      className="w-full bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800"
                     >
-                      Create Medical Record
+                      View/Create Medical Record
                     </button>
-                  </>
+                  </div>
                 )}
-                {selectedAppointment.status === 'completed' && (
-                  <button
-                    onClick={() => {
-                      handleSelectAppointment(selectedAppointment);
-                      setShowAppointmentDetails(false);
-                    }}
-                    className="flex-1 bg-black text-white py-2 px-4 rounded-lg hover:bg-gray-800"
-                  >
-                    View/Create Medical Record
-                  </button>
+
+                {/* FIX E: no-show — informational only, no actions */}
+                {selectedAppointment.status === 'no-show' && (
+                  <div className="w-full">
+                    <div className="bg-orange-50 border border-orange-200 rounded-lg p-3">
+                      <p className="text-sm text-orange-800 font-medium mb-1">Missed Appointment</p>
+                      <p className="text-sm text-orange-700">
+                        This appointment was automatically marked as a no-show. The patient was
+                        notified and can reschedule from their dashboard.
+                      </p>
+                    </div>
+                  </div>
                 )}
+
+                {/* FIX E: cancelled — informational only */}
+                {selectedAppointment.status === 'cancelled' && (
+                  <div className="w-full">
+                    <div className="bg-red-50 border border-red-200 rounded-lg p-3">
+                      <p className="text-sm text-red-800 font-medium mb-1">Appointment Cancelled</p>
+                      <p className="text-sm text-red-700">
+                        {selectedAppointment.cancellationReason || 'This appointment has been cancelled.'}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 <button
                   onClick={() => setShowAppointmentDetails(false)}
-                  className="px-6 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
+                  className="px-6 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 self-end"
                 >
                   Close
                 </button>

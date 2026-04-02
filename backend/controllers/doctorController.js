@@ -7,6 +7,96 @@ import Patient from '../models/Patient.js'
 import Notification from '../models/Notification.js'
 import Clinic from '../models/Clinic.js'
 import Availability from '../models/Availability.js'
+import AvailabilityRule from '../models/AvailabilityRule.js'
+import logAudit from '../utils/auditLogger.js'
+
+const FOLLOW_UP_REMINDER_KIND = 'follow_up_required'
+
+const syncAppointmentFollowUpState = async ({
+  appointmentId,
+  patientId,
+  followUpRequired,
+  followUpDate,
+  followUpReason,
+  followUpNotes
+}) => {
+  const appointment = await Appointment.findByIdAndUpdate(
+    appointmentId,
+    {
+      $set: {
+        isFollowUpRequired: Boolean(followUpRequired),
+        followUpDate: followUpRequired ? (followUpDate || null) : null,
+        followUpReason: followUpRequired ? (followUpReason || '') : '',
+        followUpNotes: followUpRequired ? (followUpNotes || '') : ''
+      }
+    },
+    { new: true }
+  )
+
+  if (!appointment) {
+    return null
+  }
+
+  await Notification.updateMany(
+    {
+      user: patientId,
+      type: 'reminder',
+      relatedId: appointment._id,
+      relatedModel: 'Appointment',
+      status: 'active',
+      'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+    },
+    {
+      status: 'resolved',
+      resolvedAt: new Date()
+    }
+  )
+
+  if (followUpRequired) {
+    await Notification.findOneAndUpdate(
+      {
+        user: patientId,
+        type: 'reminder',
+        relatedId: appointment._id,
+        relatedModel: 'Appointment',
+        status: 'active',
+        'metadata.reminderKind': FOLLOW_UP_REMINDER_KIND
+      },
+      {
+        $set: {
+          title: 'Follow-Up Appointment Required',
+          message: followUpDate
+            ? `Your doctor recommended a follow-up appointment by ${new Date(followUpDate).toLocaleDateString()}.`
+            : 'Your doctor recommended a follow-up appointment. Please book it when you can.',
+          priority: 'high',
+          read: false,
+          readAt: null,
+          status: 'active',
+          metadata: {
+            reminderKind: FOLLOW_UP_REMINDER_KIND,
+            appointmentId,
+            followUpDate: followUpDate || null,
+            followUpReason: followUpReason || '',
+            followUpNotes: followUpNotes || ''
+          }
+        },
+        $setOnInsert: {
+          user: patientId,
+          type: 'reminder',
+          relatedId: appointment._id,
+          relatedModel: 'Appointment'
+        }
+      },
+      {
+        upsert: true,
+        new: true,
+        setDefaultsOnInsert: true
+      }
+    )
+  }
+
+  return appointment
+}
 
 // @desc    Get doctor profile
 // @route   GET /api/doctor/profile
@@ -110,24 +200,52 @@ export const updateProfile = async (req, res) => {
 // @access  Private (Doctor only)
 export const getStats = async (req, res) => {
   try {
-    const doctorId = mongoose.Types.ObjectId(req.user.id)
+    const doctorId = new mongoose.Types.ObjectId(req.user.id)
+    const now = new Date()
+    const today = new Date(now)
+    today.setHours(0, 0, 0, 0)
 
-    // Aggregate appointments by status
-    const appointmentStats = await Appointment.aggregate([
-      { $match: { doctor: doctorId } },
-      { $group: { _id: '$status', count: { $sum: 1 } } }
+    const tomorrow = new Date(today)
+    tomorrow.setDate(today.getDate() + 1)
+
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+
+    const [
+      todayAppointments,
+      appointmentStats,
+      monthPatients,
+      confirmedCount,
+      pendingCount,
+      availabilityRules,
+      doctor
+    ] = await Promise.all([
+      Appointment.find({
+        doctor: doctorId,
+        start: { $gte: today, $lt: tomorrow }
+      }).sort({ start: 1 }).lean(),
+      Appointment.aggregate([
+        { $match: { doctor: doctorId } },
+        { $group: { _id: '$status', count: { $sum: 1 } } }
+      ]),
+      Appointment.distinct('patient', {
+        doctor: doctorId,
+        status: 'completed',
+        start: { $gte: monthStart }
+      }),
+      Appointment.countDocuments({
+        doctor: doctorId,
+        status: 'approved',
+        start: { $gte: now }
+      }),
+      Appointment.countDocuments({
+        doctor: doctorId,
+        status: 'pending',
+        start: { $gte: now }
+      }),
+      AvailabilityRule.find({ doctor: doctorId }).lean(),
+      Doctor.findOne({ userId: req.user.id }).select('rating totalReviews').lean()
     ])
 
-    // Get unique patients count
-    const uniquePatients = await Appointment.distinct('patient', {
-      doctor: doctorId,
-      status: 'completed'
-    })
-
-    // Get doctor rating and reviews
-    const doctor = await Doctor.findOne({ userId: doctorId }).select('rating totalReviews')
-
-    // Format appointment stats
     const stats = {
       total: 0,
       pending: 0,
@@ -146,11 +264,31 @@ export const getStats = async (req, res) => {
       if (stat._id === 'no-show') stats.noShow = stat.count
     })
 
+    const totalAvailabilityMinutes = availabilityRules.reduce((sum, rule) => {
+      if (!rule.startTime || !rule.endTime) return sum
+
+      const [startHour, startMinute] = rule.startTime.split(':').map(Number)
+      const [endHour, endMinute] = rule.endTime.split(':').map(Number)
+      const duration = (endHour * 60 + endMinute) - (startHour * 60 + startMinute)
+
+      return sum + Math.max(0, duration)
+    }, 0)
+
+    const availabilityPercent = Math.min(
+      100,
+      Math.round((totalAvailabilityMinutes / 2400) * 100)
+    )
+
     res.status(200).json({
       success: true,
       data: {
+        todayCount: todayAppointments.length,
+        nextAppointmentTime: todayAppointments[0]?.start ?? null,
+        totalPatients: monthPatients.length,
+        confirmedCount,
+        pendingCount,
+        availabilityPercent,
         appointments: stats,
-        totalPatients: uniquePatients.length,
         rating: doctor?.rating || 0,
         totalReviews: doctor?.totalReviews || 0
       }
@@ -232,6 +370,39 @@ export const updateAppointmentStatus = async (req, res) => {
       return res.status(403).json({ success: false, message: 'Not authorized to update this appointment' })
     }
 
+    // ✅ Doctors should not be able to cancel appointments
+    if (status === 'cancelled') {
+      return res.status(400).json({
+        success: false,
+        message: 'Doctors cannot cancel appointments. Patients must cancel through their dashboard.'
+      })
+    }
+
+    // ✅ Validate state transitions
+    const validTransitions = {
+      pending: ['approved', 'cancelled'],
+      approved: ['completed', 'cancelled', 'no-show'],
+      completed: [],
+      cancelled: [],
+      'no-show': []
+    }
+
+    const currentStatus = appointment.status
+    const allowedNextStates = validTransitions[currentStatus] || []
+
+    if (status && !allowedNextStates.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot transition from '${currentStatus}' to '${status}'. Valid transitions: ${allowedNextStates.length > 0 ? allowedNextStates.join(', ') : 'none (final state)'}`,
+        currentStatus,
+        requestedStatus: status,
+        allowedTransitions: allowedNextStates
+      })
+    }
+
+    // Capture previous status for audit
+    const previousStatus = appointment.status
+
     // Update appointment
     const updates = {}
     if (status) updates.status = status
@@ -265,6 +436,21 @@ export const updateAppointmentStatus = async (req, res) => {
         })
       }
     }
+
+    await logAudit({
+      userId: doctorId,
+      action: 'APPOINTMENT_STATUS_UPDATED',
+      resourceType: 'Appointment',
+      resourceId: appointmentId,
+      details: {
+        patientId: appointment.patient,
+        previousStatus: previousStatus,  // ✅ Use captured status
+        newStatus: status,
+        notes: notes
+      },
+      req,
+      status: 'success'
+    })
 
     res.status(200).json({
       success: true,
@@ -326,6 +512,14 @@ export const addMedicalNotes = async (req, res) => {
 
     // Update appointment status to completed
     await Appointment.findByIdAndUpdate(appointmentId, { status: 'completed' })
+    await syncAppointmentFollowUpState({
+      appointmentId,
+      patientId,
+      followUpRequired,
+      followUpDate,
+      followUpReason: diagnosis,
+      followUpNotes: notes
+    })
 
     // Add to patient's medical history if diagnosis is provided
     if (diagnosis) {
@@ -351,6 +545,21 @@ export const addMedicalNotes = async (req, res) => {
       title: 'Medical Record Updated',
       message: 'Your doctor has added notes to your appointment.',
       data: { appointmentId, medicalRecordId: medicalRecord._id }
+    })
+
+    await logAudit({
+      userId: doctorId,
+      action: 'MEDICAL_NOTES_ADDED',
+      resourceType: 'Appointment',
+      resourceId: appointmentId,
+      details: {
+        patientId: patientId,
+        hasDiagnosis: !!diagnosis,
+        hasPrescription: !!prescription,
+        hasLabTests: !!labTests
+      },
+      req,
+      status: 'success'
     })
 
     res.status(200).json({

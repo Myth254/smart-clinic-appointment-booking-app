@@ -5,21 +5,21 @@ import rateLimit from 'express-rate-limit'
  * General API rate limiter
  * Limits: 100 requests per 15 minutes per IP
  */
-export const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
-  message: {
-    success: false,
-    message: 'Too many requests from this IP, please try again after 15 minutes'
-  },
-  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
-  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
-  // Skip rate limiting for certain IPs (e.g., internal services)
-  skip: (req) => {
-    const whitelist = process.env.RATE_LIMIT_WHITELIST?.split(',') || []
-    return whitelist.includes(req.ip)
-  }
-})
+// export const apiLimiter = rateLimit({
+//   windowMs: 30 * 60 * 1000, // 30 minutes
+//   max: 100, // Limit each IP to 100 requests per windowMs
+//   message: {
+//     success: false,
+//     message: 'Too many requests from this IP, please try again after 30 minutes'
+//   },
+//   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+//   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+//   // Skip rate limiting for certain IPs (e.g., internal services)
+//   skip: (req) => {
+//     const whitelist = process.env.RATE_LIMIT_WHITELIST?.split(',') || []
+//     return whitelist.includes(req.ip)
+//   }
+// })
 
 /**
  * Strict rate limiter for authentication endpoints
@@ -27,7 +27,7 @@ export const apiLimiter = rateLimit({
  * Prevents brute force attacks
  */
 export const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 30 * 60 * 1000, // 30 minutes
   max: 5, // Limit each IP to 5 login requests per windowMs
   message: {
     success: false,
@@ -85,11 +85,10 @@ export const appointmentLimiter = rateLimit({
 
 /**
  * Admin operations rate limiter
- * Limits: 200 requests per 15 minutes
  * More generous for admin users
  */
 export const adminLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 60 * 60 * 1000, // 1 hour
   max: 200,
   message: {
     success: false,
@@ -134,7 +133,7 @@ export const emailLimiter = rateLimit({
  * Limits: 50 searches per minute per IP
  */
 export const searchLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
+  windowMs: 15 * 60 * 1000, // 15 minute
   max: 50,
   message: {
     success: false,
@@ -163,8 +162,13 @@ export const createCustomLimiter = (windowMs, max, message) => {
   })
 }
 
+const auditLogLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 100 // limit each IP to 100 requests per windowMs
+})
+
 export default {
-  apiLimiter,
+  // apiLimiter,
   authLimiter,
   registrationLimiter,
   passwordResetLimiter,
@@ -173,5 +177,6 @@ export default {
   uploadLimiter,
   emailLimiter,
   searchLimiter,
+  auditLogLimiter,
   createCustomLimiter
 }

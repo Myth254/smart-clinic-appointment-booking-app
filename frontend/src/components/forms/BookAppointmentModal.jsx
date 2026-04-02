@@ -1,9 +1,14 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Search, MapPin, Star } from 'lucide-react';
 import toast from 'react-hot-toast';
 import { patientAPI, availabilityAPI, appointmentsAPI } from '../../api';
 import { format } from 'date-fns';
 import AvailabilityChecker from './AvailabilityChecker'
+import { fromZonedTime, toZonedTime } from 'date-fns-tz';
+import { isAfter, isEqual } from 'date-fns';
+
+const TIMEZONE = 'Africa/Nairobi';
+const MIN_BOOKING_NOTICE_MINUTES = 5;
 
 const BookAppointmentModal = ({ onSuccess }) => {
   const [step, setStep] = useState(1);
@@ -17,14 +22,124 @@ const BookAppointmentModal = ({ onSuccess }) => {
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [specialtyFilter, setSpecialtyFilter] = useState('');
+  const [followUpContext, setFollowUpContext] = useState(null);
+  const slotContainerRef = React.useRef(null);
+
+  const filterFutureSlots = (slots) => {
+    const nowLocal = toZonedTime(new Date(), TIMEZONE);
+    const nowUTC = fromZonedTime(nowLocal, TIMEZONE);
+
+    return slots.filter((slot) => {
+      const slotStartUTC = new Date(slot.start);
+
+      const diffMinutes = (slotStartUTC - nowUTC) / 60000;
+      if (diffMinutes < MIN_BOOKING_NOTICE_MINUTES) return false;
+
+      return isAfter(slotStartUTC, nowUTC) || isEqual(slotStartUTC, nowUTC);
+    });
+  };
 
   useEffect(() => {
     fetchDoctors();
   }, []);
 
+  useEffect(() => {
+    try {
+      const stored = sessionStorage.getItem('followUpContext');
+      if (!stored) return;
+
+      const parsed = JSON.parse(stored);
+      
+      // ✅ FIX: Validate followUpOf is a valid string (ObjectId)
+      if (parsed.followUpOf && typeof parsed.followUpOf !== 'string') {
+        console.error('❌ Invalid followUpOf type in context:', typeof parsed.followUpOf);
+        sessionStorage.removeItem('followUpContext');
+        return;
+      }
+
+      setFollowUpContext(parsed);
+      setAppointmentType('follow-up');
+      setReason(parsed.reason || '');
+      console.log('✅ Follow-up context restored:', {
+        followUpOf: parsed.followUpOf,
+        doctorId: parsed.doctorId,
+        suggestedDate: parsed.suggestedDate
+      });
+    } catch (error) {
+      console.error('❌ Failed to restore follow-up booking context:', error);
+      sessionStorage.removeItem('followUpContext');
+    }
+  }, []);
+
   const getDoctorUserId = (doctor) => {
     return doctor.userId?._id || doctor.userId;
   };
+
+  const fetchAvailableSlots = useCallback(async (doctorUserId, date) => {
+    try {
+      setLoading(true);
+
+      const response = await availabilityAPI.getAvailableSlots(
+        doctorUserId,
+        date
+      );
+      const slotsData = response.data || response;
+      let slots = slotsData.slots || [];
+
+      // Keep only future slots
+      slots = filterFutureSlots(slots);
+
+      setAvailableSlots(slots);
+
+      // Auto-select nearest future slot
+      if (slots.length > 0) {
+        setSelectedSlot(slots[0]);
+
+        // Scroll to top where nearest slot is located
+        setTimeout(() => {
+          if (slotContainerRef.current) {
+            slotContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+          }
+        }, 100);
+      }
+
+      if (slots.length === 0) {
+        toast('No available slots for the rest of the day.', {
+          icon: '📅',
+          duration: 4000,
+        });
+      }
+    } catch (error) {
+      console.error('❌ Error fetching slots:', error);
+      toast.error(
+        error.response?.data?.message || 'Failed to load available slots'
+      );
+      setAvailableSlots([]);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!followUpContext || doctors.length === 0 || selectedDoctor) return;
+
+    const matchedDoctor = doctors.find(
+      (doctor) => getDoctorUserId(doctor) === followUpContext.doctorId
+    );
+
+    if (matchedDoctor) {
+      setSelectedDoctor(matchedDoctor);
+      if (followUpContext.suggestedDate) {
+        setSelectedDate(followUpContext.suggestedDate.slice(0, 10));
+      }
+      setStep(2);
+    }
+  }, [doctors, followUpContext, selectedDoctor]);
+
+  useEffect(() => {
+    if (step !== 2 || !selectedDoctor || !selectedDate || availableSlots.length > 0) return;
+    fetchAvailableSlots(getDoctorUserId(selectedDoctor), selectedDate);
+  }, [availableSlots.length, fetchAvailableSlots, selectedDate, selectedDoctor, step]);
 
   const fetchDoctors = async () => {
     try {
@@ -48,35 +163,6 @@ const BookAppointmentModal = ({ onSuccess }) => {
     }
   };
 
-   const fetchAvailableSlots = async (doctorUserId, date) => {
-    try {
-      setLoading(true);
-      console.log('🔍 Fetching slots for:', { doctorUserId, date });
-      
-      const response = await availabilityAPI.getAvailableSlots(doctorUserId, date);
-      
-      // Handle nested response structure
-      const slotsData = response.data || response;
-      const slots = slotsData.slots || [];
-      
-      console.log('📊 Received slots:', slots.length);
-      setAvailableSlots(slots);
-      
-      if (slots.length === 0) {
-        toast('No available slots for this date. Try another date.', {
-          icon: '📅',
-          duration: 4000
-        });
-      }
-    } catch (error) {
-      console.error('❌ Error fetching slots:', error);
-      toast.error(error.response?.data?.message || 'Failed to load available slots');
-      setAvailableSlots([]);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleNextStep = () => {
     if (step === 1 && !selectedDoctor) {
       toast.error('Please select a doctor first');
@@ -92,6 +178,9 @@ const BookAppointmentModal = ({ onSuccess }) => {
   const handlePreviousStep = () => setStep(step - 1);
 
    const handleConfirmBooking = async () => {
+    // Prevent double-submit on slow connections or accidental double-click
+    if (loading) return
+
     // Validate reason (10-500 characters as per validation.js)
     if (!reason.trim() || reason.trim().length < 10) {
       toast.error('Please enter a reason for your appointment (minimum 10 characters)');
@@ -113,33 +202,75 @@ const BookAppointmentModal = ({ onSuccess }) => {
 
       const doctorUserId = getDoctorUserId(selectedDoctor);
 
-      // ✅ Send data matching validation.js schema
-      await appointmentsAPI.createAppointment({
+      // ✅ Build payload with conditional followUpOf
+      const appointmentPayload = {
         doctorId: doctorUserId, // Changed from 'doctor' to 'doctorId'
         start: new Date(selectedSlot.start).toISOString(),
         end: new Date(selectedSlot.end).toISOString(),
         reason: reason.trim(),
         type: appointmentType, // Include appointment type
-        notes: '' // Optional notes
-      });
+        notes: '', // Optional notes
+      };
+
+      // ✅ FIX: Only include followUpOf if it's valid
+      // Defensive check: ensure it's a string (ObjectId)
+      if (followUpContext?.followUpOf && typeof followUpContext.followUpOf === 'string') {
+        appointmentPayload.followUpOf = followUpContext.followUpOf;
+        console.log('📝 Follow-up appointment linking to:', followUpContext.followUpOf);
+      } else if (followUpContext?.followUpOf) {
+        // Warn if followUpOf exists but is invalid type
+        console.warn('⚠️ Invalid followUpOf type:', typeof followUpContext.followUpOf, followUpContext.followUpOf);
+      }
+
+      console.log('📤 Final appointment payload:', appointmentPayload);
+
+      await appointmentsAPI.createAppointment(appointmentPayload);
 
       toast.success('Appointment booked successfully!');
       resetForm();
       if (onSuccess) onSuccess();
     } catch (error) {
-      console.error('Booking error:', error);
-      const errorMessage = error.response?.data?.message || 'Booking failed';
-      toast.error(errorMessage);
+      console.error('Booking error:', error)
+      const status = error.response?.status
+      const msg = error.response?.data?.message
 
-      const availableSlots = error.response?.data?.availableSlots;
-      if (availableSlots?.length > 0) {
+      if (status === 409) {
+        // The slot was taken between when the user loaded it and when they
+        // submitted. Send them back to pick again with fresh slot data.
         toast.error(
-          `Try these available times: ${availableSlots.join(', ')}`,
-          { duration: 7000 }
-        );
+          'That slot was just taken by another patient. Please choose a different time.',
+          { duration: 6000 }
+        )
+        setSelectedSlot(null)
+        // Re-fetch so the slot grid immediately reflects reality
+        if (selectedDoctor && selectedDate) {
+          fetchAvailableSlots(getDoctorUserId(selectedDoctor), selectedDate)
+        }
+        setStep(2)
+        return
+      }
+
+      if (status === 500) {
+        // The appointment may have been created server-side despite the error.
+        // Warn the user to check before retrying to avoid a duplicate booking.
+        toast.error(
+          'Something went wrong confirming your booking. Please check "My Appointments" before retrying to avoid a duplicate.',
+          { duration: 8000 }
+        )
+        return
+      }
+
+      toast.error(msg || 'Booking failed. Please try again.')
+
+      const suggestedSlots = error.response?.data?.availableSlots
+      if (suggestedSlots?.length > 0) {
+        toast(
+          `Try these available times: ${suggestedSlots.join(', ')}`,
+          { icon: '📅', duration: 7000 }
+        )
       }
     } finally {
-      setLoading(false);
+      setLoading(false)
     }
   };
 
@@ -151,6 +282,8 @@ const BookAppointmentModal = ({ onSuccess }) => {
     setSelectedSlot(null);
     setReason('');
     setAppointmentType('consultation');
+    setFollowUpContext(null);
+    sessionStorage.removeItem('followUpContext');
   };
 
   const filteredDoctors = doctors.filter((doc) => {
@@ -319,12 +452,13 @@ const BookAppointmentModal = ({ onSuccess }) => {
       {/* Step 2: Select Date & Time */}
       {step === 2 && (
         <div className="space-y-6">
+
+          {/* === Section Header === */}
           <div>
-            <h3 className="text-lg font-semibold mb-1">
-              Select Appointment Date & Time
-            </h3>
+            <h3 className="text-lg font-semibold mb-1">Select Appointment Date & Time</h3>
           </div>
 
+          {/* Doctor Summary */}
           <div className="flex items-center space-x-4 bg-gray-50 border border-gray-200 p-4 rounded-lg">
             <div className="w-12 h-12 bg-gray-200 rounded-full flex items-center justify-center font-medium text-sm">
               {selectedDoctor.firstName?.[0]}
@@ -334,20 +468,20 @@ const BookAppointmentModal = ({ onSuccess }) => {
               <h4 className="font-medium">
                 Dr. {selectedDoctor.firstName} {selectedDoctor.lastName}
               </h4>
-              <p className="text-sm text-gray-500">
-                {selectedDoctor.specialization}
-              </p>
+              <p className="text-sm text-gray-500">{selectedDoctor.specialization}</p>
             </div>
           </div>
 
+          {/* Availability Status Box */}
           <AvailabilityChecker doctorId={getDoctorUserId(selectedDoctor)} />
 
+          {/* Choose Date */}
           <div>
             <label className="block text-sm font-medium mb-2">Select Date</label>
             <input
               type="date"
               value={selectedDate}
-              min={new Date().toISOString().split('T')[0]}
+              min={new Date().toISOString().split("T")[0]}
               onChange={(e) => {
                 const date = e.target.value;
                 setSelectedDate(date);
@@ -358,39 +492,57 @@ const BookAppointmentModal = ({ onSuccess }) => {
             />
           </div>
 
+          {/* Time Slots */}
           {selectedDate && (
             <div>
               <label className="block text-sm font-medium mb-3">
                 Available Time Slots
               </label>
+
               {loading ? (
                 <div className="p-8 bg-gray-50 text-gray-500 rounded-lg text-sm text-center">
                   Loading available slots...
                 </div>
               ) : availableSlots.length > 0 ? (
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                  {availableSlots.map((slot, i) => (
-                    <button
-                      key={i}
-                      onClick={() => setSelectedSlot(slot)}
-                      className={`px-4 py-3 rounded-lg border text-sm font-medium transition ${
-                        selectedSlot?.start === slot.start
-                          ? 'bg-black text-white border-black'
-                          : 'border-gray-300 hover:border-black'
-                      }`}
-                    >
-                      {slot.label || format(new Date(slot.start), 'h:mm a')}
-                    </button>
-                  ))}
+                <div
+                  ref={slotContainerRef}
+                  className="grid grid-cols-2 sm:grid-cols-4 gap-3 max-h-72 overflow-y-auto pr-2"
+                >
+                  {availableSlots.map((slot, i) => {
+                    const isNext = i === 0;
+                    const isSelected = selectedSlot?.start === slot.start;
+
+                    return (
+                      <button
+                        key={i}
+                        onClick={() => setSelectedSlot(slot)}
+                        className={`px-4 py-3 rounded-lg border text-sm font-medium transition relative
+                          ${isSelected ? "bg-black text-white border-black" : "border-gray-300 hover:border-black"}
+                          ${isNext && !isSelected ? "ring-2 ring-green-400" : ""}
+                        `}
+                      >
+                        {/* Slot Label */}
+                        {slot.label || format(new Date(slot.start), "h:mm a")}
+
+                        {/* "Next Available" Indicator */}
+                        {isNext && !isSelected && (
+                          <span className="block text-xs text-green-600 mt-1">
+                            Next Available
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
                 </div>
               ) : (
                 <div className="p-8 bg-gray-50 text-gray-500 rounded-lg text-sm text-center">
-                  No available slots for this date. Please select another date.
+                  No available slots for the rest of the day. Please select another date.
                 </div>
               )}
             </div>
           )}
 
+          {/* Navigation Buttons */}
           <div className="flex justify-between mt-6">
             <button
               onClick={handlePreviousStep}
@@ -403,8 +555,8 @@ const BookAppointmentModal = ({ onSuccess }) => {
               disabled={!selectedSlot}
               className={`px-6 py-2 rounded-lg text-white ${
                 selectedSlot
-                  ? 'bg-black hover:bg-gray-800'
-                  : 'bg-gray-400 cursor-not-allowed'
+                  ? "bg-black hover:bg-gray-800"
+                  : "bg-gray-400 cursor-not-allowed"
               }`}
             >
               Next
@@ -442,6 +594,12 @@ const BookAppointmentModal = ({ onSuccess }) => {
                   format(new Date(selectedSlot?.start), 'h:mm a')}
               </p>
             </div>
+            {followUpContext?.followUpOf && (
+              <div>
+                <p className="text-sm text-gray-500 mb-1">Booking Context</p>
+                <p className="font-medium">This visit will be linked to your previous appointment follow-up request.</p>
+              </div>
+            )}
           </div>
 
           {/* Appointment Type Selection */}

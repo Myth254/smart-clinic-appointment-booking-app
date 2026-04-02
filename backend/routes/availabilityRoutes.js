@@ -1,4 +1,3 @@
-<<<<<<< Updated upstream
 // routes/availabilityRoutes.js
 import express from 'express'
 import {
@@ -51,22 +50,5 @@ router.delete('/exceptions/:availabilityId', protect, authorize('doctor', 'admin
 router.post('/block', protect, authorize('doctor', 'admin'), blockAvailability)
 
 router.get('/debug/:doctorId/:date', protect, debugAvailability)
-=======
-import express from 'express'
-import { protect, authorize } from '../middlewares/authMiddleware.js'
-import {
-  createRule,
-  getRulesForDoctor,
-  getAvailableSlotsForDoctorOnDate,
-  deleteRule
-} from '../controllers/availabilityController.js'
-
-const router = express.Router()
-
-router.post('/rules', protect, authorize('doctor'), createRule) // doctor creates their own rules
-router.get('/rules/:doctorId', protect, getRulesForDoctor)
-router.get('/slots/:doctorId/:date', protect, getAvailableSlotsForDoctorOnDate) // date: YYYY-MM-DD
-router.delete('/rules/:id', protect, authorize('doctor'), deleteRule)
->>>>>>> Stashed changes
 
 export default router

@@ -1,243 +1,247 @@
-/* eslint-disable react-hooks/exhaustive-deps */
-import React, { useState, useEffect, useCallback } from 'react';
-import { Calendar as CalendarIcon, Bell, LogOut } from 'lucide-react';
+/* eslint-disable no-unused-vars */
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { Calendar, LogOut, Wifi, WifiOff } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
-import { appointmentsAPI, availabilityAPI, medicalRecordsAPI } from '../api';
+import { appointmentsAPI, availabilityAPI, doctorAPI, medicalRecordsAPI } from '../api';
+import socketService from '../services/socketService';
 import {
-  startOfMonth,
-  endOfMonth,
-  eachDayOfInterval,
-  isSameDay,
-  startOfWeek,
-  endOfWeek,
-  addMonths,
-  subMonths,
+  startOfMonth, endOfMonth, eachDayOfInterval, isSameDay,
+  startOfWeek, endOfWeek, addMonths, subMonths,
 } from 'date-fns';
 import toast from 'react-hot-toast';
-import MedicalRecordsTab from '../components/doctor/MedicalRecordsTab';
-import PatientRecordsTab from '../components/doctor/PatientRecordsTab';
-import CreateMedicalRecordsTab from '../components/doctor/CreateMedicalRecordsTab';
-import OverviewTab from '../components/doctor/OverviewTab';
-import DoctorModals from '../components/doctor/DoctorModals';
+
+import MedicalRecordsTab  from '../components/doctor/MedicalRecordsTab';
+import PatientRecordsTab  from '../components/doctor/PatientRecordsTab';
+import SessionHistoryTab  from '../components/doctor/SessionHistoryTab';  // NEW
+import OverviewTab        from '../components/doctor/OverviewTab';
+import DoctorModals       from '../components/doctor/DoctorModals';
+import DoctorNotifications from '../components/doctor/DoctorNotifications';
+
+// Navigation tab definitions
+const TABS = [
+  { id: 'overview',  label: 'Overview' },
+  { id: 'sessions',  label: 'Medical Sessions' },
+  { id: 'history',   label: 'Session History' },   // NEW
+  { id: 'patients',  label: 'Patient Records' },
+];
 
 const DoctorDashboard = () => {
   const { user, logout } = useAuth();
-  const [loading, setLoading] = useState(false);
-  const [currentDate, setCurrentDate] = useState(new Date());
-  const [selectedDate, setSelectedDate] = useState(new Date());
-  const [activeTab, setActiveTab] = useState('overview');
+  const [loading,        setLoading]        = useState(false);
+  const [currentDate,    setCurrentDate]    = useState(new Date());
+  const [selectedDate,   setSelectedDate]   = useState(new Date());
+  const [activeTab,      setActiveTab]      = useState('overview');
+  const [socketConnected,setSocketConnected]= useState(false);
 
-  // State
   const [todayAppointments, setTodayAppointments] = useState([]);
-  const [allAppointments, setAllAppointments] = useState([]);
-  const [patientRecords, setPatientRecords] = useState([]);
+  const [allAppointments,   setAllAppointments]   = useState([]);
+  const [patientRecords,    setPatientRecords]     = useState([]);
   const [stats, setStats] = useState({
     todayCount: 0,
     totalPatients: 0,
     confirmedCount: 0,
-    availabilityPercent: 85,
+    pendingCount: 0,
+    availabilityPercent: 0,
+    nextAppointmentTime: null,
   });
+  const [statsLoading, setStatsLoading] = useState(true);
 
-  // Modal states
-  const [showAvailabilityModal, setShowAvailabilityModal] = useState(false);
-  const [showBlockTimeModal, setShowBlockTimeModal] = useState(false);
-  const [showAppointmentDetails, setShowAppointmentDetails] = useState(false);
-  const [selectedAppointment, setSelectedAppointment] = useState(null);
-  const [availabilityRules, setAvailabilityRules] = useState([]);
+  // Modal state
+  const [showAvailabilityModal,   setShowAvailabilityModal]   = useState(false);
+  const [showBlockTimeModal,      setShowBlockTimeModal]      = useState(false);
+  const [showAppointmentDetails,  setShowAppointmentDetails]  = useState(false);
+  const [selectedAppointment,     setSelectedAppointment]     = useState(null);
+  const [availabilityRules,       setAvailabilityRules]       = useState([]);
   const [showMedicalRecordsModal, setShowMedicalRecordsModal] = useState(false);
-  const [selectedPatientRecord, setSelectedPatientRecord] = useState(null);
+  const [selectedPatientRecord,   setSelectedPatientRecord]   = useState(null);
 
-  // Forms
   const [availabilityForm, setAvailabilityForm] = useState({
-    weekday: 1,
-    startTime: '09:00',
-    endTime: '17:00',
-    slotDurationMinutes: 30,
+    weekday: 1, startTime: '09:00', endTime: '17:00', slotDurationMinutes: 30,
   });
+  const [blockTimeForm, setBlockTimeForm] = useState({ date: '', isAvailable: false, reason: '' });
 
-  const [blockTimeForm, setBlockTimeForm] = useState({
-    date: '',
-    isAvailable: false,
-    reason: '',
-  });
+  // Ref that carries an appointment ID across a programmatic tab switch so
+  // MedicalRecordsTab can auto-start that session without an extra user click.
+  const pendingSessionAppointmentRef = useRef(null);
 
-  const weekDays = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
-  const weekDaysFull = [
-    'Sunday',
-    'Monday',
-    'Tuesday',
-    'Wednesday',
-    'Thursday',
-    'Friday',
-    'Saturday',
-  ];
+  const weekDays     = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+  const weekDaysFull = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
 
+  // ─── Socket initialisation ─────────────────────────────────────────────────
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (!token || !user) return;
+
+    socketService.connect(token);
+    setSocketConnected(socketService.getConnectionStatus());
+
+    const handleSessionStarted = (data) => {
+      toast.success(`Session started for patient: ${data.patient?.name || ''}`);
+      fetchAppointments();
+      fetchStats();
+    };
+    const handleLabUpdate        = (data) => toast(`Lab ${data.requestNumber}: ${data.status}`);
+    const handlePrescriptionUpdate = (data) => toast(`Prescription update: ${data.status}`);
+
+    // ── appointment:no_show — cron marked an appointment as missed ───────────
+    // Refresh the appointments list so the badge updates without a page reload.
+    const handleNoShow = () => {
+      fetchAppointments();
+      fetchStats();
+    };
+
+    // ── session:restore ─────────────────────────────────────────────────────
+    // When the backend socket detects the doctor reconnecting with an active
+    // session, it fires this event. We switch to the sessions tab so the
+    // MedicalRecordsTab's own restore logic will trigger and reopen the modal.
+    const handleSessionRestore = (data) => {
+      console.log('🔄 session:restore received on dashboard', data);
+      if (activeTab !== 'sessions') {
+        setActiveTab('sessions');
+        toast('Navigating to your active session…', { duration: 3000 });
+      }
+    };
+
+    socketService.onSessionStarted(handleSessionStarted);
+    socketService.onLabUpdate(handleLabUpdate);
+    socketService.onPrescriptionUpdate(handlePrescriptionUpdate);
+    socketService.onAppointmentNoShow(handleNoShow);
+    socketService.socket?.on('session:restore', handleSessionRestore);
+
+    const statusInterval = setInterval(() => setSocketConnected(socketService.getConnectionStatus()), 5000);
+
+    return () => {
+      clearInterval(statusInterval);
+      socketService.removeListener('session:started',      handleSessionStarted);
+      socketService.removeListener('lab:update',           handleLabUpdate);
+      socketService.removeListener('prescription:update',  handlePrescriptionUpdate);
+      socketService.removeListener('appointment:no_show',  handleNoShow);
+      socketService.socket?.off('session:restore', handleSessionRestore);
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.id]);
+
+  // ─── Data fetching ─────────────────────────────────────────────────────────
   const fetchAppointments = useCallback(async () => {
     try {
-      const response = await appointmentsAPI.getAppointments();
-      const data = Array.isArray(response)
-        ? response
-        : response.appointments || [];
+      const response = await appointmentsAPI.getAppointments({ limit: 1000, offset: 0 });
+      const data = Array.isArray(response) ? response : response.appointments || [];
 
-      const today = new Date();
-      today.setHours(0, 0, 0, 0);
-      const tomorrow = new Date(today);
-      tomorrow.setDate(tomorrow.getDate() + 1);
+      const today    = new Date(); today.setHours(0,0,0,0);
+      const tomorrow = new Date(today); tomorrow.setDate(tomorrow.getDate() + 1);
 
       const todayAppts = data
-        .filter((apt) => {
-          const aptDate = new Date(apt.start);
-          return aptDate >= today && aptDate < tomorrow;
-        })
+        .filter(a => { const d = new Date(a.start); return d >= today && d < tomorrow; })
         .sort((a, b) => new Date(a.start) - new Date(b.start));
 
       setTodayAppointments(todayAppts);
       setAllAppointments(data);
 
-      const totalPatients = new Set(
-        data.map((apt) => apt.patient?._id).filter(Boolean)
-      ).size;
-
-      const rulesResponse = await availabilityAPI.getDoctorRules(user.id);
-      const rules = Array.isArray(rulesResponse)
-        ? rulesResponse
-        : rulesResponse.data || [];
-
-      const calculateAvailabilityPercent = (rules) => {
-        if (!rules || rules.length === 0) return 0;
-        const totalMinutes = rules.reduce((sum, rule) => {
-          if (!rule.startTime || !rule.endTime) return sum;
-          const [startH, startM] = rule.startTime.split(':').map(Number);
-          const [endH, endM] = rule.endTime.split(':').map(Number);
-          const diff = endH * 60 + endM - (startH * 60 + startM);
-          return sum + (diff > 0 ? diff : 0);
-        }, 0);
-        return Math.min(100, Math.round((totalMinutes / 2400) * 100));
-      };
-
-      const availabilityPercent = calculateAvailabilityPercent(rules);
-
-      setStats({
-        todayCount: todayAppts.length,
-        totalPatients,
-        confirmedCount: data.filter(
-          (apt) => apt.status === 'approved' && new Date(apt.start) >= today
-        ).length,
-        availabilityPercent,
-      });
-
       return data;
-    } catch (error) {
+    } catch (err) {
+      console.error('❌ Error fetching appointments:', err);
       toast.error('Failed to fetch appointments');
-      console.error(error);
       return [];
     }
-  }, [user?.id]);
+  }, []);
 
-  // Populate patient conditions from medical records
+  const fetchStats = useCallback(async () => {
+    setStatsLoading(true);
+    try {
+      const response = await doctorAPI.getDoctorStats();
+      const data = response.data || response;
+
+      setStats({
+        todayCount: data.todayCount ?? 0,
+        totalPatients: data.totalPatients ?? 0,
+        confirmedCount: data.confirmedCount ?? 0,
+        pendingCount: data.pendingCount ?? 0,
+        availabilityPercent: data.availabilityPercent ?? 0,
+        nextAppointmentTime: data.nextAppointmentTime ?? null,
+      });
+    } catch (err) {
+      console.error('fetchStats error:', err);
+    } finally {
+      setStatsLoading(false);
+    }
+  }, []);
+
   const fetchPatientRecords = useCallback(async (appointments = []) => {
     try {
-      const completed = appointments.filter((apt) => apt.status === 'completed');
+      const completed  = appointments.filter(a => a.status === 'completed');
       const patientMap = new Map();
-      
-      // Step 1: Build basic patient map from appointments
-      completed.forEach((apt) => {
-        const patientId = apt.patient?._id;
-        if (!patientId) return;
 
-        if (!patientMap.has(patientId)) {
-          patientMap.set(patientId, {
-            patient: apt.patient,
-            lastVisit: apt.start,
-            totalVisits: 1,
-            conditions: [], // Will be populated from medical records
-            notes: apt.notes || '',
-          });
+      completed.forEach(a => {
+        const id = a.patient?._id; if (!id) return;
+        if (!patientMap.has(id)) {
+          patientMap.set(id, { patient: a.patient, lastVisit: a.start, totalVisits: 1, conditions: [], notes: a.notes || '' });
         } else {
-          const record = patientMap.get(patientId);
-          record.totalVisits++;
-          if (new Date(apt.start) > new Date(record.lastVisit)) {
-            record.lastVisit = apt.start;
-            record.notes = apt.notes || record.notes;
-          }
+          const r = patientMap.get(id); r.totalVisits++;
+          if (new Date(a.start) > new Date(r.lastVisit)) { r.lastVisit = a.start; r.notes = a.notes || r.notes; }
         }
       });
 
-      // Step 2: Fetch medical records to populate conditions
-      const patientIds = Array.from(patientMap.keys());
-      
-      // Fetch medical records for each patient in parallel
-      const recordsPromises = patientIds.map(async (patientId) => {
-        try {
-          const response = await medicalRecordsAPI.getPatientRecords(patientId);
-          const records = response.data || [];
-          
-          // Extract unique diagnoses as conditions (max 3 most recent)
-          const conditions = [...new Set(
-            records
-              .map(r => r.diagnosis)
-              .filter(Boolean)
-          )].slice(0, 3);
-          
-          return { patientId, conditions };
-        } catch (error) {
-          console.error(`Failed to fetch records for patient ${patientId}:`, error);
-          return { patientId, conditions: [] };
-        }
-      });
-
-      // Wait for all medical records to be fetched
-      const conditionsResults = await Promise.all(recordsPromises);
-      
-      // Step 3: Update patient records with conditions
-      conditionsResults.forEach(({ patientId, conditions }) => {
-        const record = patientMap.get(patientId);
-        if (record) {
-          record.conditions = conditions;
-        }
-      });
-
+      const results = await Promise.all(
+        Array.from(patientMap.keys()).map(async (pid) => {
+          try {
+            const res = await medicalRecordsAPI.getPatientRecords(pid);
+            const conditions = [...new Set((res.data || []).map(r => r.diagnosis).filter(Boolean))].slice(0, 3);
+            return { patientId: pid, conditions };
+          } catch { return { patientId: pid, conditions: [] }; }
+        })
+      );
+      results.forEach(({ patientId, conditions }) => { const r = patientMap.get(patientId); if (r) r.conditions = conditions; });
       setPatientRecords(Array.from(patientMap.values()));
-    } catch (error) {
-      console.error('Error processing patient records:', error);
-      toast.error('Failed to load complete patient records');
+    } catch (err) {
+      toast.error('Failed to load patient records');
     }
   }, []);
 
   const fetchAvailabilityRules = useCallback(async () => {
     try {
-      const response = await availabilityAPI.getDoctorRules(user.id);
-      setAvailabilityRules(response.data || []);
-    } catch (error) {
-      console.error('Failed to fetch availability rules:', error);
+      const res = await availabilityAPI.getDoctorRules(user.id);
+      setAvailabilityRules(res.data || []);
+    } catch (err) {
+      console.error('Failed to fetch availability rules:', err);
     }
   }, [user.id]);
 
   useEffect(() => {
-    const fetchData = async () => {
+    if (!user?.id) return;
+    const load = async () => {
+      setLoading(true);
       try {
-        setLoading(true);
-        const data = await fetchAppointments();
+        const [data] = await Promise.all([
+          fetchAppointments(),
+          fetchStats(),
+          fetchAvailabilityRules()
+        ]);
         await fetchPatientRecords(data);
-        await fetchAvailabilityRules();
-      } catch (error) {
-        console.error('Error fetching data:', error);
       } finally {
         setLoading(false);
       }
     };
-    fetchData();
-  }, [selectedDate, fetchAppointments, fetchPatientRecords, fetchAvailabilityRules]);
+    load();
+  }, [user?.id, fetchAppointments, fetchPatientRecords, fetchStats, fetchAvailabilityRules]);
 
+  // ─── Handlers ──────────────────────────────────────────────────────────────
   const handleUpdateStatus = async (appointmentId, status, notes = '') => {
+    setLoading(true);
     try {
-      setLoading(true);
       await appointmentsAPI.updateAppointmentStatus(appointmentId, { status, notes });
-      toast.success(`Appointment ${status}`);
+      toast.success(`Appointment ${status} successfully`);
       const data = await fetchAppointments();
-      await fetchPatientRecords(data);
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to update appointment');
+      await Promise.all([fetchPatientRecords(data), fetchStats()]);
+    } catch (err) {
+      const ed = err.response?.data;
+      if (ed?.currentStatus && ed?.allowedTransitions) {
+        const allowed = ed.allowedTransitions.length ? ed.allowedTransitions.join(', ') : 'none';
+        toast.error(`Cannot change to ${status}. Current: ${ed.currentStatus}. Valid: ${allowed}`, { duration: 5000 });
+      } else if (ed?.message?.includes('Doctors cannot cancel')) {
+        toast.error('Only patients can cancel appointments', { duration: 4000 });
+      } else {
+        toast.error(ed?.message || 'Failed to update appointment');
+      }
     } finally {
       setLoading(false);
     }
@@ -245,43 +249,29 @@ const DoctorDashboard = () => {
 
   const handleSetAvailability = async (e) => {
     e.preventDefault();
+    setLoading(true);
     try {
-      setLoading(true);
       await availabilityAPI.createRule(availabilityForm);
       toast.success('Availability rule created');
       setShowAvailabilityModal(false);
-      await fetchAvailabilityRules();
-      setAvailabilityForm({
-        weekday: 1,
-        startTime: '09:00',
-        endTime: '17:00',
-        slotDurationMinutes: 30,
-      });
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to create availability rule');
-    } finally {
-      setLoading(false);
-    }
+      await Promise.all([fetchAvailabilityRules(), fetchStats()]);
+      setAvailabilityForm({ weekday: 1, startTime: '09:00', endTime: '17:00', slotDurationMinutes: 30 });
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to create availability rule');
+    } finally { setLoading(false); }
   };
 
   const handleBlockTime = async (e) => {
     e.preventDefault();
+    setLoading(true);
     try {
-      setLoading(true);
-      await availabilityAPI.createException({
-        date: blockTimeForm.date,
-        isAvailable: blockTimeForm.isAvailable,
-        reason: blockTimeForm.reason,
-        slots: [],
-      });
+      await availabilityAPI.createException({ date: blockTimeForm.date, isAvailable: blockTimeForm.isAvailable, reason: blockTimeForm.reason, slots: [] });
       toast.success('Time blocked successfully');
       setShowBlockTimeModal(false);
       setBlockTimeForm({ date: '', isAvailable: false, reason: '' });
-    } catch (error) {
-      toast.error(error.response?.data?.message || 'Failed to block time');
-    } finally {
-      setLoading(false);
-    }
+    } catch (err) {
+      toast.error(err.response?.data?.message || 'Failed to block time');
+    } finally { setLoading(false); }
   };
 
   const handleDeleteRule = async (ruleId) => {
@@ -289,49 +279,24 @@ const DoctorDashboard = () => {
     try {
       await availabilityAPI.deleteRule(ruleId);
       toast.success('Availability rule removed');
-      await fetchAvailabilityRules();
-    } catch (error) {
-      toast.error('Failed to remove rule');
-    }
+      await Promise.all([fetchAvailabilityRules(), fetchStats()]);
+    } catch { toast.error('Failed to remove rule'); }
   };
 
-  const viewAppointmentDetails = (appointment) => {
-    setSelectedAppointment(appointment);
-    setShowAppointmentDetails(true);
-  };
+  // ── FIX B: Start session from overview modal → switch to sessions tab ──────
+  // Stores the target appointment ID in a ref (no re-render), switches to the
+  // sessions tab, and lets MedicalRecordsTab's useEffect pick it up and
+  // auto-call handleStartSession once the appointments list is ready.
+  const handleStartSessionFromModal = useCallback((appointment) => {
+    pendingSessionAppointmentRef.current = appointment._id;
+    setActiveTab('sessions');
+  }, []);
 
-  const handleSelectAppointment = (appointment) => {
-    const patientRecord = {
-      patient: appointment.patient,
-      preSelectedAppointment: appointment._id,
-    };
-    setSelectedPatientRecord(patientRecord);
-    setShowMedicalRecordsModal(true);
-  };
+  const getDaysInMonth   = () => eachDayOfInterval({ start: startOfWeek(startOfMonth(currentDate)), end: endOfWeek(endOfMonth(currentDate)) });
+  const getApptsForDate  = (date) => allAppointments.filter(a => isSameDay(new Date(a.start), date)).length;
+  const handleMonthNav   = (dir) => setCurrentDate(dir === 'prev' ? subMonths(currentDate, 1) : addMonths(currentDate, 1));
 
-  const handleViewRecords = (record) => {
-    setSelectedPatientRecord(record);
-    setShowMedicalRecordsModal(true);
-  };
-
-  const getDaysInMonth = () => {
-    const start = startOfWeek(startOfMonth(currentDate));
-    const end = endOfWeek(endOfMonth(currentDate));
-    return eachDayOfInterval({ start, end });
-  };
-
-  const getAppointmentsForDate = (date) => {
-    return allAppointments.filter((apt) => isSameDay(new Date(apt.start), date)).length;
-  };
-
-  const handleSetCurrentDate = (direction) => {
-    if (direction === 'prev') {
-      setCurrentDate(subMonths(currentDate, 1));
-    } else {
-      setCurrentDate(addMonths(currentDate, 1));
-    }
-  };
-
+  // ─── Render ─────────────────────────────────────────────────────────────────
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -340,30 +305,36 @@ const DoctorDashboard = () => {
           <div className="flex justify-between items-center h-16">
             <div className="flex items-center space-x-2">
               <div className="w-8 h-8 bg-black rounded flex items-center justify-center">
-                <CalendarIcon className="w-5 h-5 text-white" />
+                <Calendar className="w-5 h-5 text-white" />
               </div>
               <span className="text-xl font-semibold">MediBook</span>
             </div>
 
             <div className="flex items-center space-x-4">
-              <button className="p-2 hover:bg-gray-100 rounded-lg relative">
-                <Bell className="w-5 h-5" />
-              </button>
+              {/* Socket indicator */}
+              <div className={`flex items-center space-x-2 px-3 py-1.5 rounded-lg text-xs font-medium ${
+                socketConnected ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-red-50 text-red-700 border border-red-200'
+              }`}>
+                {socketConnected ? (
+                  <><Wifi className="w-3 h-3" /><span>Live</span><div className="w-1.5 h-1.5 bg-green-500 rounded-full animate-pulse" /></>
+                ) : (
+                  <><WifiOff className="w-3 h-3" /><span>Offline</span></>
+                )}
+              </div>
+
+              <DoctorNotifications />
+
               <div className="flex items-center space-x-3">
                 <div className="text-right">
-                  <div className="text-sm font-medium">
-                    Dr. {user?.firstName} {user?.lastName}
-                  </div>
+                  <div className="text-sm font-medium">Dr. {user?.firstName} {user?.lastName}</div>
                   <div className="text-xs text-gray-500">{user?.specialization}</div>
                 </div>
                 <div className="w-10 h-10 bg-black text-white rounded-full flex items-center justify-center font-medium">
                   {user?.firstName?.[0]}{user?.lastName?.[0]}
                 </div>
               </div>
-              <button
-                onClick={logout}
-                className="p-2 hover:bg-gray-100 rounded-lg flex items-center space-x-2"
-              >
+
+              <button onClick={logout} className="p-2 hover:bg-gray-100 rounded-lg flex items-center space-x-2">
                 <LogOut className="w-5 h-5" />
                 <span className="text-sm">Logout</span>
               </button>
@@ -372,32 +343,28 @@ const DoctorDashboard = () => {
         </div>
       </header>
 
-      {/* Navigation Tabs */}
+      {/* Nav tabs */}
       <div className="bg-white border-b border-gray-200">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <nav className="flex space-x-8">
-            {['overview', 'records', 'patients'].map((tab) => (
+            {TABS.map(tab => (
               <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
                 className={`py-4 px-1 border-b-2 font-medium text-sm ${
-                  activeTab === tab
+                  activeTab === tab.id
                     ? 'border-black text-black'
                     : 'border-transparent text-gray-500 hover:text-gray-700'
                 }`}
               >
-                {tab === 'overview'
-                  ? 'Overview'
-                  : tab === 'records'
-                    ? 'Medical Records'
-                    : 'Patient Records'}
+                {tab.label}
               </button>
             ))}
           </nav>
         </div>
       </div>
 
-      {/* Main Content */}
+      {/* Main content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
         {activeTab === 'overview' && (
           <OverviewTab
@@ -409,31 +376,43 @@ const DoctorDashboard = () => {
             weekDays={weekDays}
             weekDaysFull={weekDaysFull}
             getDaysInMonth={getDaysInMonth}
-            getAppointmentsForDate={getAppointmentsForDate}
-            onSetCurrentDate={handleSetCurrentDate}
+            getAppointmentsForDate={getApptsForDate}
+            onSetCurrentDate={handleMonthNav}
             onSetSelectedDate={setSelectedDate}
             onShowAvailabilityModal={() => setShowAvailabilityModal(true)}
             onShowBlockTimeModal={() => setShowBlockTimeModal(true)}
-            onViewAppointmentDetails={viewAppointmentDetails}
+            onViewAppointmentDetails={(a) => { setSelectedAppointment(a); setShowAppointmentDetails(true); }}
             onUpdateStatus={handleUpdateStatus}
             onDeleteRule={handleDeleteRule}
             loading={loading}
           />
         )}
 
-        {activeTab === 'records' && (
-          <CreateMedicalRecordsTab
-            appointments={allAppointments}
-            onSelectAppointment={handleSelectAppointment}
-            onMarkComplete={(id) => handleUpdateStatus(id, 'completed', 'Visit completed')}
+        {activeTab === 'sessions' && (
+          <MedicalRecordsTab
+            appointments={allAppointments.filter(a =>
+              // FIX B/E: include in_progress so a resumed session's appointment
+              // still appears in the list after the doctor refreshes the page.
+              a.status === 'approved' || a.status === 'in_progress'
+            )}
+            onComplete={async () => {
+              const data = await fetchAppointments();
+              await Promise.all([fetchPatientRecords(data), fetchStats()]);
+            }}
             loading={loading}
+            pendingAppointmentId={pendingSessionAppointmentRef.current}
+            onSessionStarted={() => { pendingSessionAppointmentRef.current = null; }}
+            socketConnected={socketConnected}
           />
         )}
+
+        {/* NEW: Session History tab */}
+        {activeTab === 'history' && <SessionHistoryTab />}
 
         {activeTab === 'patients' && (
           <PatientRecordsTab
             patientRecords={patientRecords}
-            onViewRecords={handleViewRecords}
+            onViewRecords={(r) => { setSelectedPatientRecord(r); setShowMedicalRecordsModal(true); }}
             loading={loading}
           />
         )}
@@ -457,21 +436,10 @@ const DoctorDashboard = () => {
         setShowAppointmentDetails={setShowAppointmentDetails}
         selectedAppointment={selectedAppointment}
         handleUpdateStatus={handleUpdateStatus}
-        handleSelectAppointment={handleSelectAppointment}
+        handleSelectAppointment={(a) => { setSelectedPatientRecord({ patient: a.patient, preSelectedAppointment: a._id }); setShowMedicalRecordsModal(true); }}
+        onStartSession={handleStartSessionFromModal}
         loading={loading}
       />
-
-      {showMedicalRecordsModal && selectedPatientRecord && (
-        <MedicalRecordsTab
-          patientRecord={selectedPatientRecord}
-          readOnly={!selectedPatientRecord.preSelectedAppointment}
-          onClose={() => {
-            setShowMedicalRecordsModal(false);
-            setSelectedPatientRecord(null);
-            fetchAppointments().then((data) => fetchPatientRecords(data));
-          }}
-        />
-      )}
     </div>
   );
 };
